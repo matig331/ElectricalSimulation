@@ -1,0 +1,36 @@
+#!/bin/bash
+# ---------------------------------------------------------------------------
+# PBS/Torque -- PARALLEL culture export (the deliverable).
+# One culture per core; each core builds its cells once, then runs its cultures.
+#
+# CONCURRENCY: set it in ONE place -- the ppn= below. Everything follows.
+#   Submit:  qsub jobs/parallel.pbs
+#   Override without editing:  qsub -v NPROC=24 jobs/parallel.pbs
+# ---------------------------------------------------------------------------
+#PBS -N culture_par
+# <-- CONCURRENCY (cores on one node)
+#PBS -l nodes=1:ppn=48
+# <-- from the dry run estimate
+#PBS -l walltime=24:00:00
+# <-- EDIT: your queue (qstat -q)
+#PBS -q batch
+#PBS -j oe
+#PBS -o culture_par.log
+
+set -euo pipefail
+
+REPO=""
+for cand in "${PBS_O_WORKDIR:-}" "${PBS_O_WORKDIR:-}/.." "$PWD" "$PWD/.." "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)"; do
+    if [ -n "$cand" ] && [ -f "$cand/culture_export.py" ]; then
+        REPO="$(cd "$cand" && pwd)"; break
+    fi
+done
+if [ -z "$REPO" ]; then echo "FATAL: repo not found" >&2; exit 1; fi
+cd "$REPO"
+
+source jobs/env_setup.sh
+
+# Concurrency: -v NPROC=... / --export overrides the resource request above.
+bash jobs/run_parallel.sh "${NPROC:-}" "${NCULT:-}"
+
+echo "finished: $(date)"

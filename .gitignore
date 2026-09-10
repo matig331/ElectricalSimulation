@@ -1,0 +1,31 @@
+# Compiled NEURON mechanisms (platform-specific; rebuild with nrnivmodl on any machine)
+x86_64/
+arm64/
+*.o
+special
+
+# Python
+__pycache__/
+*.pyc
+
+# Job run outputs -- these are DATA from a specific run, not code
+parts_*/
+culture_Pactivation*.csv
+culture_Pmap.pdf
+dryrun_Pactivation.csv
+*.log
+*.o[0-9]*
+*.e[0-9]*
+
+# Temp per-worker slice files (created and deleted during a run; stray leftovers
+# from a killed job could otherwise get committed by accident)
+_cw*.asc
+_ce_*.asc
+
+# Morphology reconstruction data (large, binary-ish, lab data -- not source code;
+# consider Git LFS or a separate data store if you DO want this version-controlled)
+eyal_archive/
+bundle_extracted/
+
+# Backups left by the MobaXterm in-place patch script
+*.bak
