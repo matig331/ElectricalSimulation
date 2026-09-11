@@ -48,13 +48,18 @@ def _placed(cell, pos_xy, theta_deg):
 
 def spikes_at(cell, pos_xy, theta_deg, i0_uA=50.0, phase_dur_ms=0.25,
               baseline_ms=5.0, post_ms=6.0, dt_ms=0.025,
-              sigma_Sm=1.5, rmin_um=12.5, ramp_us=100.0, interphase_us=0.0, phase="both"):
-    """Light: soma-only recording, short window. Returns (n_spikes, Vsoma_max)."""
+              sigma_Sm=1.5, rmin_um=12.5, ramp_us=100.0, interphase_us=0.0, phase="both",
+              detail=False, pre_end_ms=0.0, v_init_mV=V_REST):
+    """Light: soma-only recording, short window. Returns (n_spikes, Vsoma_max).
+    detail=True -> (n_spikes, Vsoma_max, tw, vw): the soma trace from `pre_end_ms` before the
+    END of phase 2 onward, with tw = t - t_end (tw = 0 exactly at the end of phase 2).
+    v_init_mV: initial voltage of every compartment (finitialize)."""
     coords, refs = _placed(cell, pos_xy, theta_deg)
     elec, sign = F.default_array(monopolar=False)
     g = F.geom_factor(coords, elec, sign, sigma_Sm=sigma_Sm, rmin_um=rmin_um)
     t_on = baseline_ms
-    t = np.arange(0.0, baseline_ms + 2 * phase_dur_ms + post_ms + dt_ms, dt_ms)
+    post = post_ms      # detail=True must NOT lengthen the run (HPC cost)
+    t = np.arange(0.0, baseline_ms + 2 * phase_dur_ms + post + dt_ms, dt_ms)
     I = F.biphasic_current(t - t_on, i0_uA, phase_dur_ms, True, ramp_us, interphase_us)  # ramped
     if phase != "both":                                    # deliver only phase 1 (+) or phase 2 (-)
         I = I * F.phase_mask(t, t_on, phase_dur_ms, phase, interphase_us)
@@ -66,9 +71,16 @@ def spikes_at(cell, pos_xy, theta_deg, i0_uA=50.0, phase_dur_ms=0.25,
         vv = h.Vector(g[k] * I); vv.play(seg._ref_e_extracellular, tvec, True); keep.append(vv)
     vs = h.Vector().record(cell.soma[0](0.5)._ref_v)
     h.celsius = 37; h.dt = dt_ms; h.tstop = t[-1]
-    h.finitialize(V_REST); h.continuerun(t[-1])
+    h.finitialize(float(v_init_mV)); h.continuerun(t[-1])
     v = np.asarray(vs)
     nsp = int(np.sum((v[:-1] < 0) & (v[1:] >= 0)))
+    if detail:
+        t_end = t_on + 2 * phase_dur_ms            # END of the biphasic pulse (after phase 2)
+        t_start = t_end - max(0.0, float(pre_end_ms))
+        m = t >= t_start
+        tw = (t[m] - t_end).astype(float)          # t=0 is exactly END of phase 2
+        vw = v[m].astype(float)
+        return nsp, float(v.max()), tw, vw
     return nsp, float(v.max())
 
 

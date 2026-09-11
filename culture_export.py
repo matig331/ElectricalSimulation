@@ -1,39 +1,82 @@
 """
-culture_export.py -- CULTURE-based activation-probability export (reviewer's spec).
+culture_export.py -- CULTURE-based activation / depolarization / hyperpolarization export.
 
 Unit = a CULTURE: one random realisation in which ALL morphologies are present, each neuron a
 random soma POSITION and random ORIENTATION. The SAME placement (position, orientation,
-morphology) is then re-simulated at each LAYER thickness -> 3 simulations per culture. For every
-soma we record whether it spikes when the well is stimulated at the lab amplitude, and we express
-the result as a probability of spiking vs the RELATIVE DISTANCE from the centre of the electrode
-array (not x,y), accounting for the neuron's ORIENTATION relative to the electrode dipole.
+morphology) is then re-simulated at each LAYER thickness -> 3 simulations per soma. For every
+simulation we record whether the soma spikes and, if it does not, the sign of its polarization
+at the END of phase 2 of the biphasic pulse.
 
-Statistic: the lab delivers >= 1 min of pulses (config.stim_duration_s). Because the pulses at
-0.2 Hz are dynamically independent (train_invariance), each pulse gives the same per-neuron
-outcome, so the whole-epoch statistic is computed from one pulse and annotated with the pulse
-count that the >= 1 min epoch corresponds to (recorded in the CSV as n_pulses).
+CELL MODEL (config.cell_model -- the single switch, recorded in every CSV row):
+  "soma_only"   : soma = full Rich active set; dendrites + stylized axon/AIS PASSIVE.
+                  v_init = the settled no-stimulus rest of THAT morphology x layer cell.
+  "full_active" : the original model (Rich + active Eyal AIS), v_init = config.v_rest_mV.
+                  Reproduces the preliminary full-active dataset bit for bit ('fired').
 
-Outputs:
-  culture_Pactivation.csv   : one row per (culture, neuron, layer): morphology, x, y,
-                              dist_from_centre, theta, rel_theta_to_dipole, n_pulses, fired
-  culture_Pmap.pdf          : P(spike) vs distance-from-centre (per layer + logistic fit),
-                              P vs distance split by dipole-orientation, and one example well.
+OUTCOMES (mutually exclusive, one per simulation):
+  activation        fired = 1 (soma crossed 0 mV at least once)
+  depolarization    not fired and DeltaV_end >  +PHASE2_EPS_MV
+  hyperpolarization not fired and DeltaV_end <  -PHASE2_EPS_MV
+  neutral           otherwise (counted as 0 in all three files)
 
-Run:   python culture_export.py            # uses config.n_cultures x n_neurons x 3 layers
+  DeltaV_end = Vm_soma(t_end) - Vm_sham(t_end), t_end = END of phase 2.
+  Vm_sham is the SAME simulation with zero stimulus current (same init, same dt, same
+  window) -- one sham per morphology x layer, computed once per process. It equals the
+  settled rest V_rest exactly when the cell starts at equilibrium. It does NOT here:
+  finitialize(V_rest) sets EVERY compartment to the somatic rest, but the equilibrium is
+  spatially non-uniform (passive axon/dendrites sit closer to e_pas), so the unstimulated soma
+  drifts by ~+0.09 mV by t_end. Referencing the scalar V_rest would let that drift, not the
+  stimulus, decide the sign of every weak far-field response. The drift is written to the CSV
+  (ctrl_drift_mV), so the scalar-referenced value is recoverable:
+      Vm(t_end) - V_rest = deltaVm_end_phase2_mV + ctrl_drift_mV.
+
+Statistic: pulses at 0.2 Hz are dynamically independent (train_invariance), so one pulse gives
+the per-neuron outcome of the whole >= 1 min epoch (config.stim_duration_s -> n_pulses column).
+
+ONE shared core, TWO drivers:
+  CellPool + iter_culture_blocks() + build_row() are used by BOTH the serial path
+  (culture_export() below) and the parallel HPC path (culture_worker.py), so the two can
+  never diverge again. CSV_HEADER is the single source of truth for the raw schema.
+  CellPool keeps ONE live NEURON cell per process: NEURON integrates every section that
+  exists, and keeping all morphology x layer cells alive made each simulation ~6x slower.
+
+Outputs of the serial path (the parallel path writes the same via culture_merge.py):
+  culture_Pactivation.csv, culture_Pdepolarization.csv, culture_Phyperpolarization.csv
+      one row per (culture, neuron, layer); all identity/provenance columns + ONE outcome
+      column (fired / depolarized / hyperpolarized) -- the input of culture_statistics.py.
+  culture_Pmap_<outcome>.pdf : quick-look maps (pooled neuron-level P, Wilson 95% CI).
+
+Run:   python culture_export.py            # serial, one core -- dry runs only
+HPC:   bash jobs/submit_seeded.sh ...       # parallel (culture_worker.py + culture_merge.py)
 Smoke: python smoke_test_culture_export.py  # offline, no NEURON
+       python smoke_test_soma_only.py       # NEURON-backed, end to end
 """
-import os, csv
+import os, csv, gc, shutil, tempfile
 import numpy as np
 
-# Single source of truth for the CSV schema, shared by the serial path
-# (culture_export()) and the parallel path (culture_worker.run_worker()).
-# 'seed' records the RNG base actually used for that row's culture -- this is
-# what lets culture_merge.py tell a genuine duplicate (same seed, same culture)
-# apart from a legitimate independent replicate (different seed, same LOCAL
-# culture index) when merging output from multiple seed-differentiated jobs.
-CSV_HEADER = ["culture", "neuron", "morphology", "layer_um", "x_um", "y_um",
-              "dist_nearest_elec_um", "dist_center_um", "dist_dipole3d_um",
-              "theta_orient_deg", "theta_pos_deg", "n_pulses", "i0_uA", "fired", "seed"]
+# ----------------------------- SCHEMA (single source of truth) ----------------------------- #
+# The 15 columns of the preliminary full-active campaign, in their original order. Parts
+# written with exactly this header are still accepted by culture_merge.py (read-only legacy).
+LEGACY_CSV_HEADER = ["culture", "neuron", "morphology", "layer_um", "x_um", "y_um",
+                     "dist_nearest_elec_um", "dist_center_um", "dist_dipole3d_um",
+                     "theta_orient_deg", "theta_pos_deg", "n_pulses", "i0_uA", "fired", "seed"]
+# Current raw schema = legacy columns (unchanged order) + soma-only provenance and outcomes.
+# 'seed' is the RNG base actually used for that row's culture: culture_merge.py uses the
+# (seed, culture) pair to tell a true duplicate from an independent replicate.
+CSV_HEADER = LEGACY_CSV_HEADER + ["cell_model", "v_rest_mV", "ctrl_drift_mV",
+                                  "deltaVm_end_phase2_mV", "phase2_outcome",
+                                  "depolarized", "hyperpolarized"]
+OUTCOME_COLS = ("fired", "depolarized", "hyperpolarized")
+# outcome name -> (file-name stem, 0/1 column). MUST match culture_statistics.OUTCOMES
+# (checked by smoke_test_culture_statistics.py).
+OUTCOME_FILES = {
+    "activation": ("Pactivation", "fired"),
+    "depolarization": ("Pdepolarization", "depolarized"),
+    "hyperpolarization": ("Phyperpolarization", "hyperpolarized"),
+}
+CELL_MODELS = ("soma_only", "full_active")
+PHASE2_EPS_MV = 1e-6      # |DeltaV_end| <= eps -> 'neutral' (numerically zero)
+
 
 # ----------------------- PURE HELPERS (offline-testable) ----------------------- #
 
@@ -297,7 +340,11 @@ def per_soma_P(X, Y, fired):
     X = np.asarray(X, float); Y = np.asarray(Y, float); fired = np.asarray(fired, float)
     key = np.round(np.stack([X, Y], 1), 2)
     uniq, inv = np.unique(key, axis=0, return_inverse=True)
-    P = np.array([fired[inv == k].mean() for k in range(len(uniq))])
+    inv = np.asarray(inv).reshape(-1)                  # numpy 1.x / 2.x return shapes differ
+    # vectorised group mean (was a per-soma boolean scan: O(N x U), hours at HPC row counts)
+    s = np.bincount(inv, weights=fired, minlength=len(uniq))
+    n = np.bincount(inv, minlength=len(uniq))
+    P = s / np.maximum(n, 1)
     return uniq[:, 0], uniq[:, 1], P
 
 
@@ -310,86 +357,919 @@ def iso_radii(r50, w, levels=(0.75, 0.5, 0.25)):
         out.append((L, float(r50 + w * np.log((1.0 - L) / L))))
     return out
 
-# ----------------------- NEURON-BACKED EXPORT ----------------------- #
+# ------------- LEGACY extremum-based classifiers -- NOT USED BY THE EXPORT ------------- #
+# _loglin_tau / fit_peak_kinetics / fit_biexp / classify_response / _post_phase2_peak belong
+# to an earlier criterion (sign of the dominant post-pulse extremum). The export now uses ONLY
+# the sign of DeltaV at the END of phase 2 (phase2_end_outcome). Kept importable because
+# smoke_test_culture_export.py tests them and older notebooks may call them.
 
-def culture_export(n_cultures=None, neurons_per_culture=None, layers=None,
-                   span_um=None, i0_uA=None, bin_um=8.0, distance_mode=None,
-                   csv_path="culture_Pactivation.csv", seed=None):
+def _loglin_tau(t, y):
+    """tau from a log-linear fit of a positive, decaying y(t): ln y = a + b t -> tau = -1/b.
+    Returns (tau_ms, amplitude_at_t0). nan if it cannot be fit."""
+    t = np.asarray(t, float); y = np.asarray(y, float)
+    m = y > 1e-4
+    if int(m.sum()) < 3:
+        return float("nan"), float("nan")
+    b, a = np.polyfit(t[m], np.log(y[m]), 1)
+    tau = -1.0 / b if b < 0 else float("nan")
+    return float(tau), float(np.exp(a))
+
+
+def fit_peak_kinetics(t, y, t_skip_ms=7.0, t_bump_ms=200.0, t_max_ms=1000.0, min_amp_mV=0.3):
+    """Bump peak + membrane relaxation, on the window from the END of the biphasic pulse (t from 0).
+    The first `t_skip` ms (fast capacitive transient) are DROPPED. In [t_skip, t_bump] the peak is the
+    largest SIGNED deflection from rest -- taken on the RAW trace, NOT |y|: the most-positive and the
+    most-negative excursions are compared, and the one larger IN MAGNITUDE wins, keeping its sign. So
+    a trace that goes mostly negative is classified hyperpol (not forced positive). tau_decay is a
+    log-linear fit of the return to rest after that peak. Returns (peak_signed_mV, t_peak_ms,
+    tau_decay_ms). numpy-only."""
+    t = np.asarray(t, float); y = np.asarray(y, float)
+    bump = (t >= t_skip_ms) & (t <= t_bump_ms)
+    if int(bump.sum()) < 3:
+        return float("nan"), float("nan"), float("nan")
+    tb = t[bump]; yb = y[bump]
+    ipos = int(np.argmax(yb)); ymax = float(yb[ipos])      # most positive (depol candidate)
+    ineg = int(np.argmin(yb)); ymin = float(yb[ineg])      # most negative (hyperpol candidate)
+    if abs(ymax) >= abs(ymin):                             # larger MAGNITUDE wins, keep its raw sign
+        peak, tpk = ymax, float(tb[ipos])
+    else:
+        peak, tpk = ymin, float(tb[ineg])
+    if abs(peak) < min_amp_mV:
+        return peak, tpk, float("nan")
+    s = 1.0 if peak >= 0 else -1.0
+    dec = (t > tpk) & (t <= t_max_ms)                      # relaxation of the bump back to rest
+    tau = float("nan")
+    if int(dec.sum()) > 5:
+        td, _ = _loglin_tau(t[dec] - t[dec][0], s * y[dec])
+        tau = td if (np.isfinite(td) and 0 < td <= t_max_ms) else float("nan")
+    return peak, tpk, tau
+
+
+# kept for reference / backward-compat
+def fit_biexp(t, y):
+    a, tpk, td = fit_peak_kinetics(t, y)
+    return a, tpk, float("nan"), td
+
+
+def classify_response(fired, dep_mV, hyp_mV, thr_mV=0.5):
+    """LEGACY -- NOT used by the export (see phase2_end_outcome).
+    Mutually-exclusive per-soma outcome from the Vm response: 'activation' if it spiked;
+    otherwise 'depol'/'hyperpol' by the SIGN of the dominant sub-threshold Vm swing (the larger of
+    the max depolarizing vs max hyperpolarizing deflection); 'none' if the deflection is negligible."""
+    if fired:
+        return "activation"
+    if dep_mV >= hyp_mV and dep_mV > thr_mV:
+        return "depol"
+    if hyp_mV > dep_mV and hyp_mV > thr_mV:
+        return "hyperpol"
+    return "none"
+
+
+MAX_DISKS = 3000   # page-3 display cap: disks drawn for at most this many somata (see below)
+
+
+def render_outcome_maps(pdf_path, tag, outcome, *, elec, sign, center, dip_c, dip_d, span,
+                        bin_um, edges, i0, n_pulses, cfg, X, Y, CULT, DN, RD, TP,
+                        max_disks=MAX_DISKS):
+    """Render the 5-page map set for one outcome (activation/depolarization/hyperpolarization).
+    NO NEURON: works from rows alone, so the serial export and culture_merge.py share it.
+    `outcome` is the per-row 0/1 array. Statistic = pooled neuron-level P with Wilson 95% CI
+    (the same estimator as culture_statistics.py).
+    HPC scale: page 3 draws one disk per soma for at most `max_disks` somata (a fixed-seed
+    random subset -- display only; P, the smooth field and every other page use ALL rows), and
+    the dense layers are rasterised so the PDF stays small at millions of rows.
+    (Was _render_maps; renamed because culture_merge.py imports it.)"""
     import matplotlib; matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from matplotlib.backends.backend_pdf import PdfPages
+    with PdfPages(pdf_path) as pdf:
+        # (1) RECRUITMENT curve: pooled NEURON-level P vs 3D dipole distance.
+        fig, ax = plt.subplots(figsize=(8, 5))
+        ctr, P1, cnt1 = radial_bin_P(RD, outcome, edges)
+        k1 = np.rint(P1 * cnt1).astype(float)
+        good = np.isfinite(P1) & (cnt1 > 0)
+        z = 1.959963984540054
+        n = cnt1.astype(float)
+        ph = np.divide(k1, n, out=np.full_like(k1, np.nan), where=n > 0)
+        den = 1.0 + z*z/n
+        cen = (ph + z*z/(2*n))/den
+        half = z*np.sqrt(ph*(1-ph)/n + z*z/(4*n*n))/den
+        lo, hi = np.clip(cen-half,0,1), np.clip(cen+half,0,1)
+        ax.fill_between(ctr[good], lo[good], hi[good], alpha=0.22, label="95% Wilson CI")
+        ax.plot(ctr[good], P1[good], "o-", ms=4, label="pooled neuron-level P")
+        gm = P1[good]
+        monotone = gm.size >= 3 and int(np.nanargmax(gm)) <= 1
+        if monotone:
+            try:
+                r50, w = fit_logistic_decreasing(ctr[good], P1[good])
+                rr = np.linspace(0, span, 200)
+                ax.plot(rr, logistic_decreasing(rr, r50, w), "k--", lw=2,
+                        label=f"logistic fit (r50={r50:.0f}um, w={w:.0f})")
+            except Exception as e:
+                print("  fit failed:", e)
+        ax.set_xlabel("3D distance from dipole centre (um)")
+        ax.set_ylabel(f"P -- {tag}"); ax.set_ylim(-0.02, 1.02)
+        ax.set_title(f"{tag}: neuron-level P(r) @ {i0:.0f} uA\n"
+                     f"each neuron observation contributes independently; Wilson 95% CI", fontsize=9)
+        ax.legend(fontsize=8); fig.tight_layout(); pdf.savefig(fig); plt.close(fig)
+
+        # (1b) pooled neuron-level P vs distance from the NEAREST electrode.
+        fig, ax = plt.subplots(figsize=(8, 5))
+        ctr2, P2, cnt2 = radial_bin_P(DN, outcome, edges)
+        k2 = np.rint(P2 * cnt2).astype(float)
+        good2 = np.isfinite(P2) & (cnt2 > 0)
+        n2 = cnt2.astype(float)
+        ph2 = np.divide(k2, n2, out=np.full_like(k2, np.nan), where=n2 > 0)
+        den2 = 1.0 + z*z/n2
+        cen2 = (ph2 + z*z/(2*n2))/den2
+        half2 = z*np.sqrt(ph2*(1-ph2)/n2 + z*z/(4*n2*n2))/den2
+        lo2, hi2 = np.clip(cen2-half2,0,1), np.clip(cen2+half2,0,1)
+        ax.fill_between(ctr2[good2], lo2[good2], hi2[good2], alpha=0.22, label="95% Wilson CI")
+        ax.plot(ctr2[good2], P2[good2], "o-", ms=4, label="pooled neuron-level P")
+        try:
+            r50n, wn = fit_logistic_decreasing(ctr2[good2], P2[good2])
+            rr = np.linspace(0, span, 200)
+            ax.plot(rr, logistic_decreasing(rr, r50n, wn), "k--", lw=2,
+                    label=f"logistic fit (r50={r50n:.0f}um, w={wn:.0f})")
+        except Exception as e:
+            print("  nearest fit failed:", e)
+        ax.set_xlabel("distance from NEAREST electrode (um)")
+        ax.set_ylabel(f"P -- {tag}"); ax.set_ylim(-0.02, 1.02)
+        ax.set_title(f"{tag}: neuron-level P vs nearest-electrode distance @ {i0:.0f} uA\n"
+                     f"Wilson 95% CI", fontsize=9)
+        ax.legend(fontsize=8); fig.tight_layout(); pdf.savefig(fig); plt.close(fig)
+
+        # (2) directional anisotropy: P vs 3D distance, split by POSITION angle to the dipole axis,
+        #     UNFOLDED so the cathode side (theta->180deg) is distinguishable from the anode side (theta->0deg)
+        fig, ax = plt.subplots(figsize=(8, 5))
+        obins = [(0, 60, "toward sign+ electrodes"), (60, 120, "~= perpendicular"), (120, 180, "toward sign- electrodes")]
+        for lo, hi, lab in obins:
+            mo = (TP >= lo) & (TP < hi)
+            ctr, P, cnt = radial_bin_P(RD[mo], outcome[mo], edges)
+            ax.plot(ctr, P, "o-", ms=4, alpha=0.85, label=f"{lo}-{hi}deg . {lab}")
+        ax.set_xlabel("3D distance from dipole centre (um)")
+        ax.set_ylabel(f"P -- {tag}"); ax.set_ylim(-0.02, 1.02)
+        ax.set_title("Directional dependence: P vs distance, by the soma's angle to the dipole axis\n"
+                     "(theta=0deg toward the sign+ electrodes, theta=180deg toward sign-; the excitatory cathode "
+                     "flips with the biphasic phase)", fontsize=9)
+        ax.legend(fontsize=8); fig.tight_layout(); pdf.savefig(fig); plt.close(fig)
+
+        # (3) ACTIVATION AREA -- an AREA PER SOMA (disk coloured by its P) over a faint smooth field,
+        #     with the dipole DIRECTIONS drawn as arrows (- -> +)
+        sx, sy, sp = per_soma_P(X, Y, outcome)
+        cmap = plt.get_cmap("plasma")
+        margin = 0.12 * span; lim = span + margin
+        gx = np.linspace(-lim, lim, 90); gy = np.linspace(-lim, lim, 90)
+        bw = max(1.5 * bin_um, 20.0)
+        Zf = smooth_P_field(X, Y, outcome, gx, gy, bw)
+        fig, ax = plt.subplots(figsize=(7.0, 6.3))
+        ax.pcolormesh(gx, gy, np.nan_to_num(Zf, nan=0.0), cmap=cmap, vmin=0, vmax=1,
+                      shading="auto", zorder=0, alpha=0.35, rasterized=True)  # faint continuous area
+        soma_r = max(0.6 * bw, 12.0)                                  # radius of each soma's area
+        n_soma = len(sx)
+        if max_disks is not None and n_soma > int(max_disks):       # display cap (see docstring)
+            show = np.random.default_rng(0).choice(n_soma, int(max_disks), replace=False)
+        else:
+            show = np.arange(n_soma)
+        for xi, yi, pi in zip(sx[show], sy[show], sp[show]):         # ONE AREA PER SOMA
+            ax.add_patch(plt.Circle((xi, yi), soma_r, color=cmap(pi), alpha=0.55, ec="none", zorder=3))
+        sc = ax.scatter(sx[show], sy[show], c=sp[show], cmap=cmap, vmin=0, vmax=1, s=14,
+                        edgecolors="w", linewidths=0.4, zorder=5, rasterized=True)  # soma centres
+        # dipole directions: an arrow from each cathode to its paired anode (- -> +)
+        an = elec[sign > 0]; ca = elec[sign < 0]
+        for (kx, ky) in ca:                                          # nearest anode to each cathode
+            j = int(np.argmin(np.hypot(an[:, 0] - kx, an[:, 1] - ky)))
+            ax.annotate("", xy=(an[j, 0], an[j, 1]), xytext=(kx, ky),
+                        arrowprops=dict(arrowstyle="-|>", color="cyan", lw=2.2, shrinkA=0, shrinkB=0), zorder=7)
+        for (ex, ey), s in zip(elec, sign):
+            ax.scatter([ex], [ey], marker="+" if s > 0 else "_", s=120, c="k", linewidths=1.8, zorder=8)
+        ax.plot([], [], color="cyan", lw=2.2, label="dipole direction (- -> +)")
+        ax.set_aspect("equal"); ax.set_xlim(-lim, lim); ax.set_ylim(-lim, lim)
+        ax.set_xlabel("x (um)"); ax.set_ylabel("y (um)")
+        shown = ("" if len(show) == n_soma
+                 else f" (disks: random {len(show)} of {n_soma} somata; field uses all)")
+        ax.set_title(f"{tag} area @ {i0:.0f} uA -- one area per soma, coloured by P{shown}\n"
+                     f"cyan arrows = the three parallel dipole directions (- -> +)", fontsize=9)
+        fig.colorbar(sc, ax=ax, label=f"P -- {tag}"); ax.legend(fontsize=8, loc="upper right")
+        fig.tight_layout(); pdf.savefig(fig); plt.close(fig)
+
+        # (4) EXPLAINER: the CENTRAL dipole drawn - -> + between its two electrodes, the position
+        #     vectors and their angle theta, and the example somata coloured by ACTIVATED vs silent.
+        an = elec[sign > 0]; ca = elec[sign < 0]
+        if len(an) and len(ca):
+            ca_c = an.mean(0); ck_c = ca.mean(0)
+            c_an = an[int(np.argmin(np.hypot(an[:, 0] - ca_c[0], an[:, 1] - ca_c[1])))]   # central anode (+)
+            c_ka = ca[int(np.argmin(np.hypot(ca[:, 0] - ck_c[0], ca[:, 1] - ck_c[1])))]   # central cathode (-)
+        else:
+            c_an, c_ka = dip_c + dip_d * 30, dip_c - dip_d * 30
+        sx2, sy2, sp2 = per_soma_P(X, Y, outcome)
+        vlen = np.hypot(sx2 - dip_c[0], sy2 - dip_c[1]); keep = vlen > 1e-6
+        sx2, sy2, sp2 = sx2[keep], sy2[keep], sp2[keep]
+        ang = np.degrees(np.arctan2(sy2 - dip_c[1], sx2 - dip_c[0]))
+        order = np.argsort(ang); n_ex = min(20, len(order))                               # <= 20 examples
+        pick = order[np.linspace(0, len(order) - 1, n_ex).astype(int)] if len(order) else []
+        outcome_ex = sp2 >= 0.5                                                             # "activated"
+        fig, ax = plt.subplots(figsize=(6.9, 6.5))
+        # central dipole: a line with an arrow from the - electrode to the + electrode
+        ax.annotate("", xy=(c_an[0], c_an[1]), xytext=(c_ka[0], c_ka[1]),
+                    arrowprops=dict(arrowstyle="-|>", color="cyan", lw=3.5), zorder=4)
+        ax.text(*(0.5 * (c_an + c_ka) + np.array([0, 6])), "central dipole  - -> +",
+                color="c", fontsize=9, ha="center", zorder=5)
+        for k in pick:
+            vx, vy = sx2[k] - dip_c[0], sy2[k] - dip_c[1]
+            col = "crimson" if outcome_ex[k] else "0.55"
+            ax.annotate("", xy=(sx2[k], sy2[k]), xytext=(dip_c[0], dip_c[1]),
+                        arrowprops=dict(arrowstyle="-|>", color="0.6", lw=1.1), zorder=3)
+            ax.scatter([sx2[k]], [sy2[k]], s=95, c=col, edgecolors="k", linewidths=0.6, zorder=6)
+            th = np.degrees(np.arctan2(abs(vx * dip_d[1] - vy * dip_d[0]), vx * dip_d[0] + vy * dip_d[1]))
+            ax.text(sx2[k], sy2[k], f"  theta={th:.0f}deg", fontsize=7.5, zorder=7)
+        for (ex, ey), s in zip(elec, sign):
+            ax.scatter([ex], [ey], marker="+" if s > 0 else "_", s=120, c="k", linewidths=1.8, zorder=2)
+        ax.scatter([dip_c[0]], [dip_c[1]], marker="o", s=40, c="k", zorder=6)
+        ax.scatter([], [], c="crimson", edgecolors="k", label=f"{tag}")
+        ax.scatter([], [], c="0.55", edgecolors="k", label="other")
+        ax.set_aspect("equal"); ax.set_xlabel("x (um)"); ax.set_ylabel("y (um)")
+        ax.set_title(f"theta = angle between the central dipole (- -> +) and each soma's position vector\n"
+                     f"(grey arrows = position vectors from the dipole centre; {n_ex} example somata)", fontsize=9)
+        ax.legend(fontsize=8, loc="upper right"); fig.tight_layout(); pdf.savefig(fig); plt.close(fig)
+    return pdf_path
+
+
+# ------------------------- PHASE-2 OUTCOME (pure, offline-testable) ------------------------- #
+
+def v_at_end_of_phase2(tw, vw):
+    """Somatic Vm at the END of phase 2. `tw` = time relative to the end of the biphasic pulse
+    (t = 0 = end of phase 2), as returned by rich_footprint.spikes_at(detail=True); the sample
+    nearest t = 0 is used. nan if the window is empty or tw/vw lengths differ."""
+    tw = np.asarray(tw, float)
+    vw = np.asarray(vw, float)
+    if tw.size == 0 or vw.size == 0 or tw.size != vw.size:
+        return float("nan")
+    return float(vw[int(np.argmin(np.abs(tw)))])
+
+
+def phase2_end_outcome(fired, dv_end_mV, eps_mV=PHASE2_EPS_MV):
+    """Mutually exclusive outcome of ONE simulation -> (label, activation, depolarized,
+    hyperpolarized). A spike wins; otherwise ONLY the sign of DeltaV_end decides (no extremum,
+    no delayed rebound). |DeltaV_end| <= eps, or nan -> 'neutral' (0 in all three files)."""
+    if int(fired):
+        return "activation", 1, 0, 0
+    dv = float(dv_end_mV)
+    if not np.isfinite(dv):
+        return "neutral", 0, 0, 0
+    if dv > eps_mV:
+        return "depol", 0, 1, 0
+    if dv < -eps_mV:
+        return "hyperpol", 0, 0, 1
+    return "neutral", 0, 0, 0
+
+
+def _phase2_end_sign(tw, vw, v_ref_mV, eps_mV=PHASE2_EPS_MV):
+    """Compatibility wrapper for older call sites -> (Vm(t_end) - v_ref, sign label).
+    Pass the SHAM value at t_end as v_ref, not the scalar rest (see the module docstring)."""
+    dv = v_at_end_of_phase2(tw, vw) - float(v_ref_mV)
+    return dv, phase2_end_outcome(0, dv, eps_mV)[0]
+
+
+# --------------------------- SCHEMA HELPERS (pure, offline-testable) --------------------------- #
+
+def build_row(culture, neuron, morph, layer, x_um, y_um, d_near, d_cen, r_dip, th_or, th_pos,
+              n_pulses, i0_uA, seed, prep, res):
+    """ONE raw CSV row in CSV_HEADER order. `prep` = prepare_cell() dict (model provenance),
+    `res` = simulate_neuron() dict (outcomes). Used by the serial export AND the worker, so
+    the two can never write different schemas. DeltaV/drift are kept to 1e-6 mV so the stored
+    value never contradicts the label (the sign threshold is PHASE2_EPS_MV = 1e-6 mV)."""
+    row = [int(culture), int(neuron), str(morph), int(layer),
+           round(float(x_um), 2), round(float(y_um), 2),
+           round(float(d_near), 2), round(float(d_cen), 2), round(float(r_dip), 2),
+           round(float(th_or), 1), round(float(th_pos), 1),
+           int(n_pulses), round(float(i0_uA), 1), int(res["fired"]), int(seed),
+           prep["cell_model"], round(float(prep["v_rest"]), 4),
+           round(float(prep["ctrl_drift"]), 6), round(float(res["dv_end"]), 6),
+           res["outcome"], int(res["depolarized"]), int(res["hyperpolarized"])]
+    if len(row) != len(CSV_HEADER):
+        raise AssertionError("build_row: %d values for %d columns" % (len(row), len(CSV_HEADER)))
+    return row
+
+
+def outcome_paths(act_csv_path):
+    """{outcome: path} of the three deliverable files, derived from the ACTIVATION path by
+    replacing 'Pactivation' in its FILE name (culture_Pactivation.csv -> culture_Pdepolarization.csv
+    and culture_Phyperpolarization.csv, in the same directory)."""
+    d, b = os.path.split(str(act_csv_path))
+    if "Pactivation" not in b:
+        raise ValueError("activation CSV name must contain 'Pactivation' (got %r)" % b)
+    return {name: os.path.join(d, b.replace("Pactivation", stem))
+            for name, (stem, _col) in OUTCOME_FILES.items()}
+
+
+def outcome_columns(header, outcome_col):
+    """Columns of ONE deliverable file: every non-outcome column of `header` (identity and
+    provenance), then the single 0/1 `outcome_col`. Exactly one outcome column per file, so
+    culture_statistics.py's rename of it to 'fired' can never create a duplicate column."""
+    return [c for c in header if c not in OUTCOME_COLS] + [outcome_col]
+
+
+class OutcomeWriter(object):
+    """Write the per-outcome deliverable CSVs in ONE streaming pass (constant memory):
+        with OutcomeWriter(header, "dir/culture_Pactivation.csv") as ow:
+            for row in rows:            # lists in `header` order
+                ow.write(row)
+        ow.paths                        # {outcome: path} actually written
+    Outcomes whose 0/1 column is absent from `header` are skipped (legacy full-active parts
+    carry only 'fired' -> activation file only)."""
+
+    def __init__(self, header, act_csv_path):
+        header = list(header)
+        targets = outcome_paths(act_csv_path)
+        out_dir = os.path.dirname(os.path.abspath(str(act_csv_path)))
+        os.makedirs(out_dir, exist_ok=True)
+        self.paths, self._fh, self._wr, self._idx = {}, [], [], []
+        for name, (_stem, col) in OUTCOME_FILES.items():
+            if col not in header:
+                continue
+            cols = outcome_columns(header, col)
+            # written as <name>.partial and renamed on a clean close(): a crashed run can never
+            # leave a truncated culture_P*.csv that culture_statistics.py would silently read
+            fh = open(targets[name] + ".partial", "w", newline="")
+            wr = csv.writer(fh)
+            wr.writerow(cols)
+            self.paths[name] = targets[name]
+            self._fh.append(fh)
+            self._wr.append(wr)
+            self._idx.append([header.index(c) for c in cols])
+        if not self.paths:
+            raise ValueError("header has none of the outcome columns %s" % (OUTCOME_COLS,))
+
+    def write(self, row):
+        for wr, idx in zip(self._wr, self._idx):
+            wr.writerow([row[i] for i in idx])
+
+    def close(self, commit=True):
+        """Close all files; commit=True renames each *.partial to its final name, commit=False
+        deletes the partials (used when the with-block raised). Idempotent."""
+        fhs, self._fh = self._fh, []
+        for fh in fhs:
+            fh.close()
+        if not fhs:
+            return
+        for p in self.paths.values():
+            if commit:
+                os.replace(p + ".partial", p)
+            elif os.path.exists(p + ".partial"):
+                os.remove(p + ".partial")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, *exc):
+        self.close(commit=exc_type is None)
+        return False
+
+
+def culture_draws(seed, c, N, n_morph, span, elec, center, dip_c, dip_d, axis_deg, h_soma_um):
+    """Placement of culture c. rng = default_rng(seed + c): the draws depend ONLY on (seed, c),
+    never on which cultures ran before -- this is what makes the parallel split exact. The draw
+    ORDER (morphology shuffle, positions, orientations) is the one every earlier version used,
+    so a given (seed, c) places the somata exactly where the full-active campaign placed them.
+    Returns a dict of per-neuron arrays."""
+    rng = np.random.default_rng(int(seed) + int(c))
+    midx = assign_morphologies(int(N), int(n_morph), rng)
+    pos = rng.uniform(-span, span, size=(int(N), 2))
+    theta = rng.uniform(0, 360, size=int(N))
+    r_dip, th_pos = directional_rt(pos, dip_c, dip_d, z_um=h_soma_um)
+    return dict(midx=midx, pos=pos, theta=theta,
+                d_near=dist_from_nearest_electrode(pos, elec),
+                d_cen=dist_from_center(pos, center),
+                r_dip=r_dip, th_pos=th_pos, th_or=rel_orientation_deg(theta, axis_deg))
+
+
+# --------------------------------- NEURON-BACKED SHARED CORE --------------------------------- #
+
+def resolve_cell_model(cfg_or_name):
+    """Validated cell-model name from a config object (its .cell_model) or a plain string.
+    Fails loudly (no silent default) if missing or unknown: the model is scientifically
+    meaningful and is recorded in every row."""
+    name = cfg_or_name if isinstance(cfg_or_name, str) else getattr(cfg_or_name, "cell_model", None)
+    if name not in CELL_MODELS:
+        raise ValueError("cell_model must be one of %s, got %r (set it in config.py)"
+                         % (CELL_MODELS, name))
+    return name
+
+
+def build_cell_for_model(asc_path, cell_model):
+    """Build the Rich cell with the biophysics of `cell_model` (see the module docstring)."""
+    from rich_cell import build_rich_cell
+    return build_rich_cell(asc_path, soma_only=(resolve_cell_model(cell_model) == "soma_only"))
+
+
+def _rest_and_sham(cell, cell_model, cfg, morph, layer, rest_tstop_ms=1500.0):
+    """Initial condition and sham reference of a freshly built cell -> dict(v_rest, v_sham_end,
+    ctrl_drift).
+      v_rest     : v_init of every simulation. soma_only -> the settled no-stimulus rest of THIS
+                   cell (rich_cell.settled_resting_voltage, from -85 mV); full_active ->
+                   cfg.v_rest_mV (the legacy init, so 'fired' reproduces the preliminary dataset)
+      v_sham_end : somatic Vm at the end of phase 2 of the SAME protocol with ZERO current. It is
+                   placement-independent (with I = 0 the extracellular drive is 0 everywhere).
+      ctrl_drift : v_sham_end - v_rest, the init drift that DeltaV_end removes."""
+    from rich_cell import settled_resting_voltage
+    from rich_footprint import spikes_at
+    if cell_model == "soma_only":
+        v_rest = float(settled_resting_voltage(cell, tstop_ms=rest_tstop_ms, dt_ms=cfg.dt_ms))
+    else:
+        v_rest = float(cfg.v_rest_mV)
+    n0, _vmax0, tw0, vw0 = spikes_at(cell, (0.0, 0.0), 0.0, i0_uA=0.0, detail=True,
+                                     pre_end_ms=0.0, v_init_mV=v_rest)
+    if n0 > 0:
+        raise RuntimeError("%s L%d (%s): the cell spikes with ZERO stimulus -- the rest state "
+                           "is not quiescent, every outcome would be meaningless"
+                           % (morph, int(layer), cell_model))
+    v_sham_end = v_at_end_of_phase2(tw0, vw0)
+    if not np.isfinite(v_sham_end):
+        raise RuntimeError("%s L%d: sham run returned no sample at the end of phase 2"
+                           % (morph, int(layer)))
+    return dict(v_rest=v_rest, v_sham_end=float(v_sham_end),
+                ctrl_drift=float(v_sham_end - v_rest))
+
+
+def prepare_cell(morph, layer, cfg=None, cell_model=None, tag="_ce_", rest_tstop_ms=1500.0):
+    """ONE-OFF helper for diagnostics and tests: build one (morphology x layer) cell and return
+    dict(cell, morph, layer, cell_model, v_rest, v_sham_end, ctrl_drift) (see _rest_and_sham).
+    Do NOT keep many of these alive in a loop -- every live cell slows every simulation; the
+    drivers use CellPool instead. The temporary sliced .asc is pid-tagged and removed."""
+    from config import CFG
+    from morphologies import find_one_morphology
+    from slicer import reduced_asc
+    cfg = CFG if cfg is None else cfg
+    cell_model = resolve_cell_model(cfg if cell_model is None else cell_model)
+    out = "%s%d_%s_%d.asc" % (tag, os.getpid(), morph, int(layer))
+    asc = reduced_asc(find_one_morphology(morph), layer, out_path=out)
+    try:
+        cell = build_cell_for_model(asc, cell_model)
+    finally:
+        if asc and os.path.exists(asc):
+            os.remove(asc)
+    info = _rest_and_sham(cell, cell_model, cfg, morph, layer, rest_tstop_ms)
+    return dict(cell=cell, morph=str(morph), layer=float(layer), cell_model=cell_model, **info)
+
+
+def simulate_neuron(prep, pos_xy, theta_deg, i0_uA):
+    """ONE stimulation of a prepared cell (prepare_cell) placed at `pos_xy` (um), rotated by
+    `theta_deg`. Same protocol as the sham (rich_footprint.spikes_at defaults, v_init = v_rest).
+    Returns dict(fired, dv_end, outcome, depolarized, hyperpolarized),
+    dv_end = Vm(t_end) - Vm_sham(t_end)."""
+    from rich_footprint import spikes_at
+    nsp, _vmax, tw, vw = spikes_at(prep["cell"], (float(pos_xy[0]), float(pos_xy[1])),
+                                   float(theta_deg), i0_uA=float(i0_uA), detail=True,
+                                   pre_end_ms=0.0, v_init_mV=prep["v_rest"])
+    dv_end = v_at_end_of_phase2(tw, vw) - prep["v_sham_end"]
+    label, act, depo, hypo = phase2_end_outcome(int(nsp > 0), dv_end)
+    return dict(fired=act, dv_end=float(dv_end), outcome=label,
+                depolarized=depo, hyperpolarized=hypo)
+
+
+class CellPool(object):
+    """At most ONE live NEURON cell per process -- the drivers' only way to get cells.
+
+    WHY: NEURON integrates EVERY section that exists, so each simulation also pays for every
+    other live cell. Measured (soma_only, one morphology): 1 live cell 0.52 s/sim; 6 live
+    cells, each placed once (the previous worker design, which kept ALL morphology x layer
+    cells) 2.96 s/sim, with bit-identical voltages. Removing 'extracellular' from idle cells
+    does not help (2.71 s); destroying them does (0.40 s). So the pool destroys the live cell
+    before building the next.
+
+    Rebuilds are cheap and exact: the sliced .asc of each (morphology, layer) is cached in a
+    private temp dir (scratch created and removed by THIS process), a rebuild takes ~0.1-0.2 s,
+    and it reproduces v_rest, the sham and every Vm sample bit for bit -- so v_rest/v_sham_end
+    are computed on the FIRST build only and reused (see smoke_test_soma_only.py).
+
+    Never keep a reference to a pool cell (it would stay alive): use simulate(), n_spikes(),
+    info(). with-statement or close() removes the scratch dir."""
+
+    def __init__(self, cfg=None, cell_model=None, rest_tstop_ms=1500.0):
+        from config import CFG
+        self.cfg = CFG if cfg is None else cfg
+        self.cell_model = resolve_cell_model(self.cfg if cell_model is None else cell_model)
+        self.rest_tstop_ms = float(rest_tstop_ms)
+        self._tmp = tempfile.mkdtemp(prefix="estim_cells_%d_" % os.getpid())
+        self._asc, self._info = {}, {}
+        self._key, self._cell = None, None
+        self.n_builds = 0
+
+    def _drop(self):
+        self._cell, self._key = None, None
+        gc.collect()                       # make sure the old cell's sections are really gone
+
+    def _activate(self, morph, layer):
+        key = (str(morph), float(layer))
+        if key == self._key:
+            return key
+        self._drop()                       # destroy BEFORE building: never two live cells
+        asc = self._asc.get(key)
+        if asc is None:
+            from morphologies import find_one_morphology
+            from slicer import reduced_asc
+            asc = reduced_asc(find_one_morphology(key[0]), key[1],
+                              out_path=os.path.join(self._tmp, "%s_L%d.asc" % (key[0], int(key[1]))))
+            self._asc[key] = asc
+        self._cell = build_cell_for_model(asc, self.cell_model)
+        self._key = key
+        self.n_builds += 1
+        if key not in self._info:
+            self._info[key] = _rest_and_sham(self._cell, self.cell_model, self.cfg,
+                                             key[0], key[1], self.rest_tstop_ms)
+        return key
+
+    def info(self, morph, layer):
+        """Provenance of (morph, layer): dict(morph, layer, cell_model, v_rest, v_sham_end,
+        ctrl_drift). Builds the cell on first use (to compute rest and sham)."""
+        key = (str(morph), float(layer))
+        if key not in self._info:
+            self._activate(*key)
+        return dict(morph=key[0], layer=key[1], cell_model=self.cell_model, **self._info[key])
+
+    def simulate(self, morph, layer, pos_xy, theta_deg, i0_uA):
+        """Biphasic stimulation + classification (simulate_neuron) of (morph, layer) placed at
+        pos_xy / theta_deg."""
+        key = self._activate(morph, layer)
+        return simulate_neuron(dict(cell=self._cell, **self._info[key]), pos_xy, theta_deg, i0_uA)
+
+    def n_spikes(self, morph, layer, pos_xy, theta_deg, i0_uA, phase="both"):
+        """Somatic spike count only (phase='p1'/'p2' = monophasic delivery, for phase_split)."""
+        from rich_footprint import spikes_at
+        key = self._activate(morph, layer)
+        return int(spikes_at(self._cell, (float(pos_xy[0]), float(pos_xy[1])), float(theta_deg),
+                             i0_uA=float(i0_uA), phase=phase,
+                             v_init_mV=self._info[key]["v_rest"])[0])
+
+    def close(self):
+        self._drop()
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+
+def iter_culture_blocks(pool, c, d, morphs, layers, i0, n_pulses, seed, block=25):
+    """Simulate culture `c` (draws `d` from culture_draws) in BLOCKS of `block` neurons; yield
+    (rows, n_neurons_done) after each block. Shared by the serial driver and the worker.
+
+    Inside a block the simulations are GROUPED by (morphology, layer), so the one-live-cell
+    pool rebuilds each cell at most once per block (<= n_morph x n_layers cheap rebuilds). The
+    rows are returned NEURON-major (neuron i with all its layers), exactly the order every
+    earlier version wrote, so a culture cut short after any block is an unbiased random subset
+    of COMPLETE neurons (the flush happens between blocks, see culture_worker.py)."""
+    N = len(d["midx"])
+    block = max(1, int(block))
+    for b0 in range(0, N, block):
+        idx = list(range(b0, min(N, b0 + block)))
+        res = {}
+        for mi, morph in enumerate(morphs):
+            members = [i for i in idx if int(d["midx"][i]) == mi]
+            if not members:
+                continue
+            for layer in layers:
+                for i in members:
+                    res[(i, layer)] = pool.simulate(morph, layer, d["pos"][i], d["theta"][i], i0)
+        rows = []
+        for i in idx:
+            morph = morphs[int(d["midx"][i])]
+            for layer in layers:
+                rows.append(build_row(c, i, morph, layer, d["pos"][i, 0], d["pos"][i, 1],
+                                      d["d_near"][i], d["d_cen"][i], d["r_dip"][i],
+                                      d["th_or"][i], d["th_pos"][i], n_pulses, i0, seed,
+                                      pool.info(morph, layer), res[(i, layer)]))
+        yield rows, idx[-1] + 1
+
+
+# columns render_outcome_set() needs, in this order (depolarized/hyperpolarized nan = absent)
+PLOT_COLUMNS = ("culture", "x_um", "y_um", "dist_nearest_elec_um", "dist_dipole3d_um",
+                "theta_pos_deg", "layer_um", "fired", "depolarized", "hyperpolarized")
+
+
+def render_outcome_set(arr, out_dir, prefix, span, bin_um, i0, n_pulses, cfg, elec, sign):
+    """Quick-look maps for every outcome present in `arr` (float array, columns PLOT_COLUMNS;
+    an outcome column that is all-nan -- legacy data -- is skipped). Writes
+    <out_dir>/<prefix>Pmap_<outcome>.pdf; returns {outcome: pdf}. NO NEURON."""
+    arr = np.asarray(arr, dtype=float)
+    center = electrode_center(elec)
+    dip_c, dip_d = dipole_frame(elec, sign)
+    ctx = dict(elec=elec, sign=sign, center=center, dip_c=dip_c, dip_d=dip_d, span=span,
+               bin_um=bin_um, edges=np.arange(0, span + bin_um, bin_um), i0=i0,
+               n_pulses=n_pulses, cfg=cfg, X=arr[:, 1], Y=arr[:, 2], CULT=arr[:, 0],
+               DN=arr[:, 3], RD=arr[:, 4], TP=arr[:, 5])
+    out = {}
+    for k, name in enumerate(("activation", "depolarization", "hyperpolarization")):
+        col = arr[:, 7 + k]
+        if not np.all(np.isfinite(col)):
+            continue
+        out[name] = render_outcome_maps(os.path.join(out_dir, "%sPmap_%s.pdf" % (prefix, name)),
+                                        name, col, **ctx)
+    return out
+
+
+# ------------------------------------- SERIAL DRIVER ------------------------------------- #
+
+def culture_export(n_cultures=None, neurons_per_culture=None, layers=None,
+                   span_um=None, i0_uA=None, bin_um=8.0, distance_mode=None,
+                   csv_path="culture_Pactivation.csv", seed=None, make_figures=True,
+                   block=25):
+    """SERIAL driver (ONE core): dry runs and smoke tests only. Production HPC runs use the
+    parallel path (culture_worker.py + culture_merge.py), which calls the same prepare_cell /
+    simulate_neuron / build_row, in the same neuron-major order, so for the same (seed, culture)
+    both paths write the same rows.
+
+    Writes the three per-outcome CSVs (names derived from `csv_path`, see outcome_paths) and,
+    unless make_figures=False, three quick-look PDFs next to them. `distance_mode` is accepted
+    for API compatibility only: every distance metric is written to the CSV.
+    Returns (csv_activation, csv_depolarization, csv_hyperpolarization)."""
+    import matplotlib; matplotlib.use("Agg")
+    from config import CFG
+    import field as F
+
+    cfg = CFG
+    n_cultures = cfg.n_cultures if n_cultures is None else int(n_cultures)
+    seed_used = cfg.seed if seed is None else int(seed)
+    N = cfg.n_neurons_effective() if neurons_per_culture is None else int(neurons_per_culture)
+    layers = layers or cfg.layers_um
+    span = cfg.span_half_um() if span_um is None else float(span_um)
+    i0 = cfg.i0_uA if i0_uA is None else float(i0_uA)
+    cell_model = resolve_cell_model(cfg)
+    n_pulses = cfg.n_pulses_for_duration()
+    morphs = cfg.morphologies
+    M = len(morphs)
+    elec, sign = F.default_array(pitch_um=cfg.pitch_um, monopolar=not cfg.bipolar)
+    center = electrode_center(elec)
+    axis = dipole_axis_deg(elec, sign)
+    dip_c, dip_d = dipole_frame(elec, sign)
+
+    print(f"[culture_export SERIAL | {cell_model}] {n_cultures} cultures x {N} neurons x "
+          f"{len(layers)} layers = {n_cultures * N * len(layers)} sims @ {i0:.0f} uA | "
+          f"{M} morphologies | seed={seed_used} | stat over {n_pulses} pulses")
+    print("  outcome: sign of DeltaV = Vm(end of phase 2) - Vm_sham(end of phase 2)")
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    act_path = csv_path if os.path.isabs(csv_path) else os.path.join(here, csv_path)
+    pcols = [CSV_HEADER.index(k) for k in PLOT_COLUMNS]
+    plot = []
+    with CellPool(cfg, cell_model) as pool:
+        for layer in layers:                      # rest + sham of every cell, logged up front
+            for m in morphs:
+                p = pool.info(m, layer)
+                print(f"  {m} L{int(layer)} um: v_rest = {p['v_rest']:.4f} mV | "
+                      f"sham drift at end of phase 2 = {p['ctrl_drift']:+.6f} mV")
+        with OutcomeWriter(CSV_HEADER, act_path) as ow:
+            for c in range(n_cultures):
+                d = culture_draws(seed_used, c, N, M, span, elec, center, dip_c, dip_d, axis,
+                                  cfg.h_soma_um)
+                for rows, _n_done in iter_culture_blocks(pool, c, d, morphs, layers, i0,
+                                                         n_pulses, seed_used, block):
+                    for row in rows:
+                        ow.write(row)
+                        plot.append([float(row[j]) for j in pcols])
+                print(f"  culture {c}: done")
+        paths = ow.paths
+        print("  cell builds: %d (one live cell at a time)" % pool.n_builds)
+    print("done CSVs:", ", ".join(paths[k] for k in OUTCOME_FILES))
+
+    if make_figures and plot:
+        prefix = os.path.basename(act_path).split("Pactivation")[0]
+        pdfs = render_outcome_set(np.asarray(plot, dtype=float), os.path.dirname(act_path),
+                                  prefix, span, bin_um, i0, n_pulses, cfg, elec, sign)
+        for pdf in pdfs.values():
+            print("done PDF:", pdf)
+    return paths["activation"], paths["depolarization"], paths["hyperpolarization"]
+
+
+def _post_phase2_peak(t, dv, search_ms=5.0):
+    """LEGACY -- NOT used by the export or by single_neuron_check (see phase2_end_outcome).
+    Choose the signed response attributable to the END of phase 2.
+
+    t is relative to the END of the biphasic pulse (t=0 = end of phase 2).
+    dv is Vm - passive resting baseline.
+
+    Criterion:
+      1) inspect only 0..search_ms after pulse end;
+      2) find the FIRST true local extremum after t=0 (max or min);
+      3) compare it with the boundary value at 0+; if the boundary deflection is
+         already larger in magnitude, keep 0+ (the phase-2 lobe peaked at pulse end);
+      4) sign of the selected value: + = depol, - = hyperpol.
+
+    Returns peak, t_peak, sign, dv_at_end.
+    """
+    t = np.asarray(t, float)
+    dv = np.asarray(dv, float)
+    m = (t >= 0.0) & (t <= float(search_ms))
+    if int(m.sum()) < 2:
+        return float("nan"), float("nan"), "none", float("nan")
+
+    tt = t[m]
+    yy = dv[m]
+    dv0 = float(yy[0])
+
+    # 3-point smoothing only for extremum detection; reported amplitude is RAW.
+    ys = yy.copy()
+    if yy.size >= 3:
+        ys[1:-1] = (yy[:-2] + yy[1:-1] + yy[2:]) / 3.0
+
+    # First local max OR min after t=0.
+    cand = []
+    for i in range(1, len(ys) - 1):
+        is_max = ys[i] > ys[i - 1] and ys[i] >= ys[i + 1]
+        is_min = ys[i] < ys[i - 1] and ys[i] <= ys[i + 1]
+        if is_max or is_min:
+            cand.append(i)
+            break
+
+    if cand:
+        i = cand[0]
+        local_peak = float(yy[i])
+        # If the largest deflection is already present at pulse end, call t=0 the peak.
+        if abs(dv0) >= abs(local_peak):
+            peak, tpk = dv0, float(tt[0])
+        else:
+            peak, tpk = local_peak, float(tt[i])
+    else:
+        # Monotonic relaxation: the phase-2 response peaks at the pulse boundary.
+        peak, tpk = dv0, float(tt[0])
+
+    if peak > 0:
+        sign = "depol"
+    elif peak < 0:
+        sign = "hyperpol"
+    else:
+        sign = "neutral"
+    return float(peak), float(tpk), sign, dv0
+
+
+def single_neuron_check(morphology=None, layer=None, positions=None, thetas=None, i0_uA=None,
+                        t_max_ms=20.0, out_pdf="single_neuron_check.pdf",
+                        out_csv="single_neuron_check.csv", soma_only=True):
+    """One morphology/layer tested over several soma positions and orientations.
+
+    Visual check of the phase-2 sign criterion used by the export. Each trace covers the
+    whole 0.5-ms biphasic pulse:
+        phase 1: -0.50 .. -0.25 ms
+        phase 2: -0.25 ..  0.00 ms
+        t = 0: END of phase 2 / END of the biphasic pulse.
+
+    Plotted and classified: DeltaVm(t) = Vm_stim(t) - Vm_sham(t), where Vm_sham is the same
+    protocol with zero current (the unstimulated trajectory from the same init) -- exactly the
+    reference the export uses. Sign criterion: sign of DeltaVm(t=0) ONLY
+    (+ -> depolarization, - -> hyperpolarization); no extremum search, no delayed rebound.
+    The CSV also records ctrl_drift_mV = Vm_sham(0) - v_rest (the init drift removed).
+    """
+    import matplotlib; matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from math import ceil
     from config import CFG
     from morphologies import find_one_morphology
     from slicer import reduced_asc
     from rich_cell import build_rich_cell
     from rich_footprint import spikes_at
-    import field as F
 
     cfg = CFG
-    n_cultures = cfg.n_cultures if n_cultures is None else int(n_cultures)
-    seed_used = cfg.seed if seed is None else int(seed)   # RNG base; recorded per row below
-    # neurons in a culture = the biological well count (cfg.n_neurons); NOT a separate dial
-    N = (cfg.n_neurons_effective() if neurons_per_culture is None else int(neurons_per_culture))
-    layers = layers or cfg.layers_um
-    span = cfg.span_half_um() if span_um is None else float(span_um)
+    morph = morphology or cfg.morphologies[0]
+    layer = float(layer if layer is not None else cfg.layers_um[0])
     i0 = cfg.i0_uA if i0_uA is None else float(i0_uA)
-    distance_mode = getattr(cfg, "culture_distance_mode", "centroid") if distance_mode is None else distance_mode
-    n_pulses = cfg.n_pulses_for_duration()
-    morphs = cfg.morphologies; M = len(morphs)
-    elec, sign = F.default_array(pitch_um=cfg.pitch_um, monopolar=not cfg.bipolar)
-    center = electrode_center(elec); axis = dipole_axis_deg(elec, sign)
-    dip_c, dip_d = dipole_frame(elec, sign)        # dipole centre + unit direction (- -> +)
+    phi = float(cfg.phase_dur_ms)
 
-    print(f"[culture_export] {n_cultures} cultures x {N} neurons x {len(layers)} layers "
-          f"= {n_cultures*N*len(layers)} sims @ {i0:.0f} uA | stat over {n_pulses} pulses "
-          f"({cfg.stim_duration_s:.0f} s); seed={seed_used} | all {M} morphologies per culture "
-          f"| distance='{distance_mode}'")
+    if positions is None:
+        positions = [
+            (90, -30), (-90, -30), (120, -30), (-120, -30),
+            (150, -30), (-150, -30), (0, 90), (0, -150),
+            (100, 60), (-100, 60), (100, -120), (-100, -120),
+            (140, 40), (-140, 40), (160, -90), (-160, -90),
+            (110, -110), (-110, -110), (130, 10), (-130, 10)
+        ]
+    if thetas is None:
+        # One neuron, same morphology, sampled at clearly different orientations.
+        thetas = [0.0, 45.0, 90.0, 135.0]
 
-    # cache one built cell per (morphology, layer): spikes_at re-places it per call
-    cells = {}
-    for layer in layers:
-        for m in morphs:
-            asc = reduced_asc(find_one_morphology(m), layer, out_path=f"_ce_{m}_{int(layer)}.asc")
-            cells[(m, layer)] = build_rich_cell(asc)
-            if asc and os.path.exists(asc):
-                os.remove(asc)
+    asc = reduced_asc(find_one_morphology(morph), layer,
+                      out_path=f"_snc_{morph}_{int(layer)}.asc")
+    cell = build_rich_cell(asc, soma_only=soma_only)
+    if asc and os.path.exists(asc):
+        os.remove(asc)
+
+    # IMPORTANT: a pure passive cell has only 'pas', hence its exact equilibrium is e_pas.
+    # Do not initialise it at the active-model rest (~ -73.9 mV), otherwise the trace contains
+    # an artificial relaxation toward -84.395 mV that can masquerade as post-pulse polarity.
+    from rich_cell import settled_resting_voltage
+    v_baseline = settled_resting_voltage(cell, tstop_ms=1500.0, dt_ms=cfg.dt_ms)
+    # SHAM: identical protocol and window, zero current -> the unstimulated trajectory.
+    # finitialize(v_baseline) is not the (spatially non-uniform) equilibrium, so Vm_sham drifts;
+    # subtracting it leaves only the stimulus-evoked change (see the module docstring).
+    _n0, _vm0, tw_sham, vw_sham = spikes_at(cell, (0.0, 0.0), 0.0, i0_uA=0.0, detail=True,
+                                            pre_end_ms=2.0 * phi, v_init_mV=v_baseline)
+    v_sham_end = v_at_end_of_phase2(tw_sham, vw_sham)
+    drift = v_sham_end - v_baseline
+    print(f"[single_neuron_check] rest {v_baseline:.4f} mV | sham drift at end of phase 2 "
+          f"{drift:+.6f} mV")
+
+    panels, rows = [], []
+    for (x, y) in positions:
+        for th in thetas:
+            nsp, vmax, tw, vw = spikes_at(
+                cell, (float(x), float(y)), float(th), i0_uA=i0, detail=True,
+                pre_end_ms=2.0 * phi, v_init_mV=v_baseline
+            )
+            fired = int(nsp > 0)
+            if len(vw) != len(vw_sham):
+                raise RuntimeError("stim and sham traces have different lengths")
+            dv = vw - vw_sham                          # stimulus-evoked DeltaVm(t)
+
+            dv0 = v_at_end_of_phase2(tw, vw) - v_sham_end
+            sgn2 = phase2_end_outcome(0, dv0)[0]       # sign only (spike shown separately)
+            peak2, tpk2 = dv0, 0.0
+
+            rows.append([
+                x, y, th, fired,
+                round(float(v_baseline), 4),
+                round(float(dv0), 6),
+                round(float(peak2), 6),
+                round(float(tpk2), 4),
+                sgn2,
+                round(float(drift), 6)
+            ])
+            panels.append((x, y, th, tw, dv, peak2, tpk2, dv0, sgn2, fired))
 
     here = os.path.dirname(os.path.abspath(__file__))
-    csv_full = os.path.join(here, csv_path)
-    rows = []
-    with open(csv_full, "w", newline="") as fh:
-        w = csv.writer(fh)
-        w.writerow(CSV_HEADER)
-        for c in range(n_cultures):
-            rng = np.random.default_rng(seed_used + c)         # unique culture
-            midx = assign_morphologies(N, M, rng)              # all morphologies present
-            pos = rng.uniform(-span, span, size=(N, 2))        # random soma positions
-            theta = rng.uniform(0, 360, size=N)                # random orientations
-            d_near = dist_from_nearest_electrode(pos, elec)
-            d_cen = dist_from_center(pos, center)
-            r_dip, th_pos = directional_rt(pos, dip_c, dip_d, z_um=cfg.h_soma_um)  # 3D dist + angle-to-dipole
-            th_or = rel_orientation_deg(theta, axis)           # neuron orientation vs field
-            d = {"centroid": d_cen, "nearest": d_near, "dipole": r_dip}.get(distance_mode, d_cen)
-            for layer in layers:                               # SAME placement, vary layer
-                for i in range(N):
-                    fired = int(spikes_at(cells[(morphs[midx[i]], layer)],
-                                          (float(pos[i, 0]), float(pos[i, 1])),
-                                          float(theta[i]), i0_uA=i0)[0] > 0)
-                    w.writerow([c, i, morphs[midx[i]], int(layer), round(float(pos[i, 0]), 2),
-                                round(float(pos[i, 1]), 2), round(float(d_near[i]), 2),
-                                round(float(d_cen[i]), 2), round(float(r_dip[i]), 2),
-                                round(float(th_or[i]), 1), round(float(th_pos[i]), 1),
-                                n_pulses, round(i0, 1), fired, seed_used])
-                    rows.append((c, float(pos[i, 0]), float(pos[i, 1]), float(d_near[i]),
-                                 float(r_dip[i]), float(th_pos[i]), int(layer), fired))
-            print(f"  culture {c}: done")
+    with open(os.path.join(here, out_csv), "w", newline="") as fh:
+        wr = csv.writer(fh)
+        wr.writerow([
+            "x_um", "y_um", "theta_deg", "fired", "baseline_mV",
+            "deltaVm_at_end_mV", "phase2_peak_mV", "phase2_peak_time_ms", "sign",
+            "ctrl_drift_mV"
+        ])
+        wr.writerows(rows)
 
-    rows = np.array(rows)  # cols: culture, x, y, d_nearest, r_dipole, theta_pos, layer, fired
-    pdf_full = render_culture_figures(rows, span, bin_um, i0, n_pulses, cfg, elec, sign,
-                                      dip_c, dip_d, os.path.join(here, "culture_Pmap.pdf"))
+    n = len(panels)
+    ncol = 4
+    nrow = int(ceil(n / ncol))
+    fig, axes = plt.subplots(nrow, ncol, figsize=(4.2 * ncol, 2.75 * nrow), squeeze=False)
 
-    print("done:", csv_full, "and", pdf_full)
-    return csv_full, pdf_full
+    for ax, (x, y, th, tw, dv, peak2, tpk2, dv0, sgn2, fired) in zip(axes.flat, panels):
+        m = (tw >= -2.0 * phi) & (tw <= t_max_ms)
+        tt, yy = tw[m], dv[m]
+        col = "crimson" if sgn2 == "depol" else ("steelblue" if sgn2 == "hyperpol" else "0.4")
+
+        ax.plot(tt, yy, color=col, lw=1.25, label="DeltaVm = Vm(stim) - Vm(sham)")
+
+        # Show exactly where the two stimulus phases occur.
+        ax.axvspan(-2.0 * phi, -phi, color="royalblue", alpha=0.12, zorder=0,
+                   label="phase 1 (+I)")
+        ax.axvspan(-phi, 0.0, color="crimson", alpha=0.12, zorder=0,
+                   label="phase 2 (-I)")
+        ax.axvline(-phi, color="0.45", ls=":", lw=0.9)
+        ax.axvline(0.0, color="k", ls="--", lw=1.0)
+        ax.axhline(0.0, color="0.65", ls=":", lw=0.8)
+
+        # Orange square: actual membrane deflection exactly at the end of phase 2.
+        ax.scatter([0.0], [dv0], marker="s", s=28, c="darkorange", zorder=7,
+                   label=f"DeltaVm(0+)={dv0:+.3f} mV")
+
+        # Black dot: the point whose sign is actually used.
+        ax.scatter([tpk2], [peak2], c="k", s=32, zorder=8,
+                   label=f"SELECTED={peak2:+.3f} mV @{tpk2:.3f} ms -> {sgn2}")
+
+        
+
+        # Tight zoom around the full biphasic response + early post-pulse period.
+        early = (tt >= -2.0 * phi) & (tt <= min(t_max_ms, 5.0))
+        if early.any():
+            lo, hi = float(np.min(yy[early])), float(np.max(yy[early]))
+            pad = 0.18 * (hi - lo + 1e-6)
+            ax.set_ylim(lo - pad, hi + pad)
+
+        spike_txt = " . SPIKE" if fired else ""
+        ax.set_title(f"({x:.0f},{y:.0f}) um . theta={th:.0f}deg . {sgn2}{spike_txt}", fontsize=7.2)
+        ax.tick_params(labelsize=6)
+        ax.set_xlim(-2.0 * phi - 0.05, t_max_ms)
+        ax.legend(fontsize=4.8, loc="best")
+
+    for ax in axes.flat[n:]:
+        ax.axis("off")
+
+    model_txt = "SOMA-ONLY ACTIVE" if soma_only else "FULL ACTIVE"
+    fig.suptitle(
+        f"Single-neuron phase-2 sign check -- {model_txt} -- morphology {morph}, "
+        f"layer {int(layer)} um, +/-{i0:.0f} uA\n"
+        f"phase 1 = [-{2*phi:.2f}, -{phi:.2f}] ms; phase 2 = [-{phi:.2f}, 0] ms; "
+        f"t=0 = END pulse. Sign criterion: sign[Vm(t=0) - Vm_sham(t=0)]. "
+        f"Black dot/square at t=0 = value that decides the sign.",
+        fontsize=10
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.975])
+    p = os.path.join(here, out_pdf)
+    fig.savefig(p)
+    plt.close(fig)
+    print("done:", p, "and", os.path.join(here, out_csv))
+    return p
 
 
 def phase_split(n_cultures=None, neurons_per_culture=None, layers=None, span_um=None, i0_uA=None):
@@ -401,14 +1281,13 @@ def phase_split(n_cultures=None, neurons_per_culture=None, layers=None, span_um=
     Caveat: phase1-only + phase2-only is NOT the full biphasic pulse (phase 1 preconditions the
     membrane for phase 2). Read these as 'what each phase excites on its own' -- the causal
     attribution of activation to a phase -- not an exact decomposition. The deliverable P (both
-    phases, culture_export) remains the one the network consumes."""
+    phases, culture_export) remains the one the network consumes.
+    Uses config.cell_model and the same v_init as the export (prepare_cell), so the phase
+    attribution describes the SAME model as the deliverable."""
     import matplotlib; matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from matplotlib.backends.backend_pdf import PdfPages
     from config import CFG
-    from morphologies import find_one_morphology
-    from slicer import reduced_asc
-    from rich_cell import build_rich_cell
     from rich_footprint import spikes_at
     import field as F
 
@@ -424,27 +1303,20 @@ def phase_split(n_cultures=None, neurons_per_culture=None, layers=None, span_um=
     print(f"[phase_split] {n_cultures} cultures x {N} x {len(layers)} layers x 2 phases "
           f"= {n_cultures*N*len(layers)*2} sims @ {i0:.0f} uA")
 
-    cells = {}
-    for layer in layers:
-        for m in morphs:
-            asc = reduced_asc(find_one_morphology(m), layer, out_path=f"_ps_{m}_{int(layer)}.asc")
-            cells[(m, layer)] = build_rich_cell(asc)
-            if asc and os.path.exists(asc):
-                os.remove(asc)
-
     X, Y, F1, F2 = [], [], [], []
-    for c in range(n_cultures):
-        rng = np.random.default_rng(cfg.seed + c)
-        midx = assign_morphologies(N, M, rng)
-        pos = rng.uniform(-span, span, size=(N, 2)); theta = rng.uniform(0, 360, size=N)
-        for layer in layers:
-            for i in range(N):
-                cell = cells[(morphs[midx[i]], layer)]
-                p = (float(pos[i, 0]), float(pos[i, 1])); th = float(theta[i])
-                f1 = int(spikes_at(cell, p, th, i0_uA=i0, phase="p1")[0] > 0)
-                f2 = int(spikes_at(cell, p, th, i0_uA=i0, phase="p2")[0] > 0)
-                X.append(p[0]); Y.append(p[1]); F1.append(f1); F2.append(f2)
-        print(f"  culture {c}: done")
+    with CellPool(cfg) as pool:                   # one live cell; grouped by (layer, morphology)
+        for c in range(n_cultures):
+            rng = np.random.default_rng(cfg.seed + c)
+            midx = assign_morphologies(N, M, rng)
+            pos = rng.uniform(-span, span, size=(N, 2)); theta = rng.uniform(0, 360, size=N)
+            for layer in layers:
+                for mi, m in enumerate(morphs):
+                    for i in np.flatnonzero(midx == mi):
+                        p = (float(pos[i, 0]), float(pos[i, 1])); th = float(theta[i])
+                        f1 = int(pool.n_spikes(m, layer, p, th, i0, phase="p1") > 0)
+                        f2 = int(pool.n_spikes(m, layer, p, th, i0, phase="p2") > 0)
+                        X.append(p[0]); Y.append(p[1]); F1.append(f1); F2.append(f2)
+            print(f"  culture {c}: done")
     X, Y, F1, F2 = map(np.asarray, (X, Y, F1, F2))
 
     here = os.path.dirname(os.path.abspath(__file__))
@@ -476,9 +1348,9 @@ def phase_split(n_cultures=None, neurons_per_culture=None, layers=None, span_um=
     return out
 
 
-if __name__ == "__main__":
-    culture_export()
-
+# ---------------- legacy per-culture renderer (mean +/- SD ACROSS cultures) ---------------- #
+# Kept with its original API (smoke_test_culture_parallel.py; external callers). The HPC
+# merge now renders render_outcome_maps (neuron-level, same estimator as culture_statistics).
 
 def render_culture_figures(rows, span, bin_um, i0, n_pulses, cfg, elec, sign,
                            dip_c, dip_d, out_pdf):
@@ -650,3 +1522,7 @@ def render_culture_figures(rows, span, bin_um, i0, n_pulses, cfg, elec, sign,
                      f"(grey arrows = position vectors from the dipole centre; {n_ex} example somata)", fontsize=9)
         ax.legend(fontsize=8, loc="upper right"); fig.tight_layout(); pdf.savefig(fig); plt.close(fig)
     return pdf_full
+
+
+if __name__ == "__main__":
+    culture_export()

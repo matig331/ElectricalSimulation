@@ -49,12 +49,21 @@ print('i0_uA            :', CFG.i0_uA)
 print('total sims       :', CFG.n_cultures * n * len(CFG.layers_um))
 "
 
+# SERIAL = ONE core. Refuse a production-size run here: at ~10 s/sim a full culture
+# campaign would need months. Production runs use jobs/submit_seeded.sh (parallel).
+NSIMS=$(python -c "from config import CFG; print(CFG.n_cultures * CFG.n_neurons_effective() * len(CFG.layers_um))")
+if [ "$NSIMS" -gt "${MAX_SERIAL_SIMS:-2000}" ] && [ "${ALLOW_SERIAL:-0}" != "1" ]; then
+    echo "FATAL: serial run of $NSIMS simulations on ONE core. Use jobs/submit_seeded.sh," \
+         "or set ALLOW_SERIAL=1 if you really mean it." >&2
+    exit 1
+fi
+
 SECONDS=0
 python culture_export.py
 echo "---------------------------------------------------------------"
 echo "elapsed: ${SECONDS} s"
-wc -l culture_Pactivation.csv
+wc -l culture_Pactivation.csv culture_Pdepolarization.csv culture_Phyperpolarization.csv
 echo "finished: $(date)"
 
-# Expected on success: culture_Pactivation.csv (the deliverable the network
-# consumes) and culture_Pmap.pdf, both in $REPO.
+# Expected on success, in $REPO: culture_Pactivation.csv, culture_Pdepolarization.csv,
+# culture_Phyperpolarization.csv and culture_Pmap_<outcome>.pdf (config.cell_model).

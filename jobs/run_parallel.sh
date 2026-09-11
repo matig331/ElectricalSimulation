@@ -16,6 +16,23 @@
 #                         (if you set it in your qsub/sbatch call too) the job name
 #       PARTS_DIR      = force the parts directory name (overrides the automatic
 #                         naming below)
+#       EXPECT_MODEL   = set by the submitters: abort if config.cell_model differs
+#                         (config.py edited while the job sat in the queue)
+#       OVERWRITE=1    = allow re-running a tag whose parts already hold data
+#                         (otherwise the job refuses instead of deleting them)
+#       NEURONS_PER_CULTURE = override neurons/culture (default: config.n_neurons_effective(),
+#                         the biological count, e.g. 1700). For CONCURRENCY TIMING ONLY: a small
+#                         value (e.g. 20, matching jobs/dryrun.pbs) lets `$CONC` workers each run
+#                         a few neurons under REAL multi-process contention in minutes instead of
+#                         hours, so the concurrent s/sim can be checked against the solo number
+#                         from dryrun.pbs BEFORE sizing a multi-day submission (see
+#                         HPC_RUN_COMPLETE.md, "Walltime"). Never set this for a real campaign --
+#                         it silently shrinks every culture, it does not just speed up a test.
+#
+# RESULTS LAYOUT (jobs/results_layout.sh): everything goes under
+# results_<cell_model>/, so a soma_only job can never touch full_active data:
+#   results_<model>/parts_<tag>/part_NNN.csv   raw worker output
+#   results_<model>/<tag>/culture_P*.csv       this job's merge (CSV only)
 #
 # TWO WAYS TO SPLIT WORK ACROSS JOBS -- pick ONE per set of jobs, don't mix:
 #
@@ -31,17 +48,26 @@
 #       merging replicates never confuses "culture 0 of run1" with "culture 0 of
 #       run2" -- each gets its own row in the per-culture statistics.
 #
-# Either way the parts directory is job-scoped (named after JOB_NAME, or the
-# offset/seed if no name is given), so 'rm -rf' below can never touch another
-# job's in-progress output even if several jobs run at the same time.
+# Either way the parts directory is job- AND model-scoped, so the cleanup below
+# can never touch another job's (or the other model's) output, even when several
+# jobs run at the same time.
 #
-# Re-submitting the SAME (offset, seed) combination re-simulates the SAME
-# cultures (deterministic -- harmless to correctness) but overwrites that job's
-# own parts/CSV. If you ever hand culture_merge.py two directories that DO share
-# a (seed, culture) pair, it refuses to merge rather than silently double-
-# counting it.
+# Re-running the SAME tag re-simulates the SAME cultures (deterministic). Because a
+# finished run can hold 100+ h of compute, the job now REFUSES to delete existing
+# parts unless OVERWRITE=1. If you ever hand culture_merge.py two directories that
+# share a (seed, culture) pair, it refuses to merge rather than double-count.
 # ---------------------------------------------------------------------------
 set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/results_layout.sh"
+
+# ---- cell model: decides the results tree --------------------------------------
+MODEL="$(cfg_cell_model)"
+if [ -n "${EXPECT_MODEL:-}" ] && [ "$EXPECT_MODEL" != "$MODEL" ]; then
+    echo "FATAL: this job was submitted for cell_model=$EXPECT_MODEL but config.py now says" \
+         "$MODEL (edited while queued?). Refusing to run the wrong model." >&2
+    exit 1
+fi
+RESULTS="results_${MODEL}"
 
 # ---- concurrency ------------------------------------------------------------
 if [ "${1:-}" != "" ]; then
@@ -76,20 +102,33 @@ elif [ -n "$SEED" ]; then
 else
     TAG="off${OFFSET}"
 fi
-PARTS="${PARTS_DIR:-parts_${TAG}}"
+PARTS="${PARTS_DIR:-${RESULTS}/parts_${TAG}}"
+OUTDIR="${RESULTS}/${TAG}"
 
+echo "cell model  : $MODEL   -> $RESULTS/"
 echo "concurrency : $CONC core(s)"
 echo "cultures    : $NCULT (local ids ${OFFSET}..$((OFFSET+NCULT-1)))"
 echo "seed        : ${SEED:-<config.seed, unset>}"
 echo "job tag     : $TAG"
 echo "flush every : ${FLUSH_EVERY:-25} neurons"
+[ -n "${NEURONS_PER_CULTURE:-}" ] && echo "neurons/cult: ${NEURONS_PER_CULTURE} (NEURONS_PER_CULTURE override -- NOT the biological count; concurrency-timing runs only)"
 python -c "
 from config import CFG
-n = CFG.n_neurons_effective()
+n = ${NEURONS_PER_CULTURE:-0} or CFG.n_neurons_effective()
 print('neurons/cult:', n)
 print('layers      :', len(CFG.layers_um))
 print('total sims  :', $NCULT * n * len(CFG.layers_um))
 "
+
+# ---- never silently delete finished work ----------------------------------------
+if parts_have_data "$PARTS"; then
+    if [ "${OVERWRITE:-0}" != "1" ]; then
+        echo "FATAL: $PARTS already holds simulated data. Re-running tag '$TAG' would" \
+             "DELETE it. Use a new JOB_NAME, move the directory away, or set OVERWRITE=1." >&2
+        exit 1
+    fi
+    echo "OVERWRITE=1: deleting existing $PARTS"
+fi
 
 # ---- build the worker task list ---------------------------------------------
 rm -rf "$PARTS"; mkdir -p "$PARTS"
@@ -108,11 +147,13 @@ echo "---------------------------------------------------------------"
 
 # ---- run them ----------------------------------------------------------------
 export _WORKER_SEED="$SEED" _WORKER_NAME="$NAME" _WORKER_FLUSH="${FLUSH_EVERY:-25}"
+export _WORKER_NEURONS="${NEURONS_PER_CULTURE:-}"
 START=$SECONDS
 if ! tr '\t' ' ' < "$PARTS/tasks.txt" | xargs -P "$CONC" -L1 bash -c \
         'python culture_worker.py --ids "$0" --out "$1" \
             ${_WORKER_SEED:+--seed "$_WORKER_SEED"} \
             ${_WORKER_NAME:+--job-name "$_WORKER_NAME"} \
+            ${_WORKER_NEURONS:+--neurons "$_WORKER_NEURONS"} \
             --flush-every "$_WORKER_FLUSH"'; then
     echo "FATAL: at least one worker failed -- NOT merging." >&2
     exit 1
@@ -121,10 +162,11 @@ ELAPSED=$((SECONDS - START))
 echo "---------------------------------------------------------------"
 echo "all workers finished in ${ELAPSED} s"
 
-# ---- merge THIS job's own parts into its OWN csv -- never overwrites another
-#      job's output. Run jobs/merge_all.sh once every job has finished to
-#      combine all of them into the single final culture_Pactivation.csv.
-OUT_CSV="culture_Pactivation_${TAG}.csv"
-python culture_merge.py --parts "$PARTS" --out "$OUT_CSV"
+# ---- merge THIS job's own parts into its OWN three CSVs (no figures: rendering
+#      must not eat the end of the walltime). Once every job has finished -- or hit
+#      its walltime, in which case this step never runs -- use jobs/merge_all.sh,
+#      which reads the raw parts of ALL jobs and also renders the figures.
+python culture_merge.py --parts "$PARTS" --out-dir "$OUTDIR" --no-figures \
+       --expect-model "$MODEL"
 echo "wall time: ${ELAPSED} s on ${CONC} core(s)"
-echo "output    : $OUT_CSV"
+echo "output    : $OUTDIR/culture_P{activation,depolarization,hyperpolarization}.csv"

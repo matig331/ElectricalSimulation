@@ -2,7 +2,8 @@
 
 Runs with NO NEURON and NO simulation: it exercises the id parsing, the worker/culture
 split, the RNG-equivalence argument the whole design rests on, the merge validation
-(overlap + truncation detection), and the shared renderer.
+(overlap + truncation detection), the three-file split, the model/schema guards, the
+walltime-kill cases (torn last line, trailing incomplete neuron), and the renderers.
 
     python smoke_test_culture_parallel.py        # expect: 'All smoke tests passed.'
 
@@ -11,6 +12,7 @@ Every check prints PASS/FAIL, so a partial failure is visible rather than swallo
 import csv
 import os
 import shutil
+from collections import Counter
 import sys
 import tempfile
 
@@ -19,6 +21,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from culture_worker import CSV_HEADER, parse_ids, split_ids
+from culture_export import LEGACY_CSV_HEADER
 
 FAILURES = []
 
@@ -108,14 +111,39 @@ try:
     parts_dir = os.path.join(tmp, "parts")
     os.makedirs(parts_dir)
 
-    def write_part(path, cultures, rows_per_culture=6, header=None, seed=0):
+    OUT3 = [("activation", 1, 0, 0), ("depol", 0, 1, 0), ("hyperpol", 0, 0, 1),
+            ("neutral", 0, 0, 0)]
+
+    def cur_row(c, i, seed=0, layer=40, model="soma_only"):
+        lab, f, dp, hp = OUT3[i % 4]
+        return [c, i, "60303", layer, 1.0 * i, 2.0 * i, 10.0, 20.0, 21.0, 30.0, 40.0, 36,
+                50.0, f, seed, model, -83.18, 0.0896, 0.01 * (i % 4 - 1.5), lab, dp, hp]
+
+    def write_part(path, cultures, rows_per_culture=6, header=None, seed=0, layers=(40,),
+                   model="soma_only"):
         with open(path, "w", newline="") as fh:
             w = csv.writer(fh)
             w.writerow(header if header is not None else CSV_HEADER)
             for c in cultures:
                 for i in range(rows_per_culture):
+                    for lay in layers:                  # neuron-major, like the worker
+                        w.writerow(cur_row(c, i, seed, lay, model))
+
+    def write_legacy_part(path, cultures, rows_per_culture=6, seed=0):
+        with open(path, "w", newline="") as fh:
+            w = csv.writer(fh)
+            w.writerow(LEGACY_CSV_HEADER)
+            for c in cultures:
+                for i in range(rows_per_culture):
                     w.writerow([c, i, "60303", 40, 1.0 * i, 2.0 * i, 10.0, 20.0, 21.0,
-                                30.0, 40.0, 36, 50.0, i % 2, seed])
+                                30.0, 40.0, 16, 50.0, i % 2, seed])
+
+    def rejected(fn, *a, **k):
+        try:
+            fn(*a, **k)
+            return False
+        except SystemExit:
+            return True
 
     write_part(os.path.join(parts_dir, "part_00.csv"), [0, 2])
     write_part(os.path.join(parts_dir, "part_01.csv"), [1, 3])
@@ -204,9 +232,13 @@ try:
     check("different-seed jobs sharing local culture ids are NOT rejected",
           sorted(counts3) == [(1000, 0), (1000, 1), (2000, 0), (2000, 1), (3000, 0), (3000, 1)])
 
-    out_seeded = os.path.join(tmp, "seeded_out.csv")
-    culture_merge.merge(os.path.join(seeded, "parts_run*"), out_seeded, make_figures=False)
-    with open(out_seeded, newline="") as fh:
+    out_seeded_dir = os.path.join(tmp, "seeded_out")
+    paths, _ = culture_merge.merge(os.path.join(seeded, "parts_run*"), out_seeded_dir,
+                                   make_figures=False)
+    check("merge writes the three deliverable files",
+          sorted(paths) == ["activation", "depolarization", "hyperpolarization"] and
+          all(os.path.exists(v) for v in paths.values()))
+    with open(paths["activation"], newline="") as fh:
         merged_rows = list(csv.DictReader(fh))
     check("merged output has 'local_culture' and 'seed' columns for traceability",
           {"local_culture", "seed"} <= set(merged_rows[0].keys()))
@@ -221,6 +253,103 @@ try:
                if r["seed"] == "2000" and r["local_culture"] == "0"}
     check("seed=1000 culture=0 and seed=2000 culture=0 map to DIFFERENT global ids "
           "(no pseudoreplication)", g_1000_0 and g_2000_0 and g_1000_0 != g_2000_0)
+
+    # ---- the three files: same simulations, one outcome column each, consistent labels
+    files3 = {}
+    for name, pth in paths.items():
+        with open(pth, newline="") as fh:
+            files3[name] = list(csv.DictReader(fh))
+    same_ids = len({tuple((r["culture"], r["neuron"], r["layer_um"]) for r in v)
+                    for v in files3.values()}) == 1
+    check("all three files hold the same simulations in the same order", same_ids)
+    ok_lab = all(
+        (a["fired"], d["depolarized"], h["hyperpolarized"]) ==
+        {"activation": ("1", "0", "0"), "depol": ("0", "1", "0"),
+         "hyperpol": ("0", "0", "1"), "neutral": ("0", "0", "0")}[a["phase2_outcome"]]
+        for a, d, h in zip(files3["activation"], files3["depolarization"],
+                           files3["hyperpolarization"]))
+    check("outcome columns agree with phase2_outcome in every row", ok_lab)
+    check("no file carries another outcome's column",
+          "fired" not in files3["depolarization"][0] and
+          "depolarized" not in files3["activation"][0])
+
+    # ---- guards added with the soma-only merge -------------------------------------
+    print("\n[4b] model/schema guards and walltime-kill cases")
+    g = os.path.join(tmp, "guards")
+    def mk(name):
+        d = os.path.join(g, name)
+        os.makedirs(d)
+        return d
+    d = mk("legacy")
+    write_legacy_part(os.path.join(d, "part_000.csv"), [0, 1], seed=1000)
+    lp, _ = culture_merge.merge(d, os.path.join(g, "legacy_out"), make_figures=False)
+    check("legacy (preliminary full-active) parts merge -> activation file only",
+          list(lp) == ["activation"])
+    with open(lp["activation"], newline="") as fh:
+        hdr = next(csv.reader(fh))
+        check("legacy merged header = legacy columns + local_culture, 'fired' last",
+              sorted(hdr) == sorted(LEGACY_CSV_HEADER + ["local_culture"]) and hdr[-1] == "fired")
+    d = mk("mixed_schema")
+    write_legacy_part(os.path.join(d, "part_000.csv"), [0], seed=1000)
+    write_part(os.path.join(d, "part_001.csv"), [1], seed=1000)
+    check("legacy + current parts in one merge -> rejected",
+          rejected(culture_merge.read_parts, sorted(
+              os.path.join(d, f) for f in os.listdir(d))))
+    d = mk("mixed_model")
+    write_part(os.path.join(d, "part_000.csv"), [0], seed=5, model="soma_only")
+    write_part(os.path.join(d, "part_001.csv"), [1], seed=5, model="full_active")
+    check("soma_only + full_active rows in one merge -> rejected",
+          rejected(culture_merge.read_parts, sorted(
+              os.path.join(d, f) for f in os.listdir(d))))
+    d = mk("expect")
+    write_part(os.path.join(d, "part_000.csv"), [0], seed=5, model="soma_only")
+    check("--expect-model mismatch -> rejected",
+          rejected(culture_merge.read_parts, [os.path.join(d, "part_000.csv")],
+                   expect_model="full_active"))
+    d = mk("empty")
+    open(os.path.join(d, "part_000.csv"), "w").close()
+    check("0-byte part (worker died before the header) -> rejected",
+          rejected(culture_merge.read_parts, [os.path.join(d, "part_000.csv")]))
+    d = mk("nonexcl")
+    with open(os.path.join(d, "part_000.csv"), "w", newline="") as fh:
+        w = csv.writer(fh); w.writerow(CSV_HEADER)
+        r = cur_row(0, 0); r[CSV_HEADER.index("depolarized")] = 1   # fired AND depolarized
+        w.writerow(r)
+    check("row with non-exclusive outcomes -> rejected",
+          rejected(culture_merge.read_parts, [os.path.join(d, "part_000.csv")]))
+    # walltime kill: torn LAST line (right field count, empty final field) -> dropped
+    d = mk("torn")
+    fp = os.path.join(d, "part_000.csv")
+    write_part(fp, [0], rows_per_culture=4, layers=(40, 80, 120), seed=7)
+    with open(fp, "a", newline="") as fh:
+        fh.write(",".join(str(x) for x in cur_row(0, 4, 7, 40)[:-1]) + ",")
+    rows_t, counts_t = culture_merge.read_parts([fp])
+    check("torn last line dropped, the complete rows kept (12)", len(rows_t) == 12)
+    # the SAME tear in the middle of a file is corruption, not a kill -> rejected
+    d = mk("torn_mid")
+    fp2 = os.path.join(d, "part_000.csv")
+    with open(fp, newline="") as src_fh:
+        lines = src_fh.read().split("\r\n")
+    lines.insert(3, lines[-1])                              # torn line moved mid-file
+    with open(fp2, "w", newline="") as fh:
+        fh.write("\r\n".join(lines))
+    check("a malformed line that is NOT the last -> rejected",
+          rejected(culture_merge.read_parts, [fp2]))
+    # walltime kill between two flushes: last neuron has only 2 of its 3 layers -> dropped
+    d = mk("trail")
+    fp3 = os.path.join(d, "part_000.csv")
+    write_part(fp3, [0], rows_per_culture=5, layers=(40, 80, 120), seed=9)
+    with open(fp3, "a", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(cur_row(0, 5, 9, 40)); w.writerow(cur_row(0, 5, 9, 80))
+    rows_tr, counts_tr = culture_merge.read_parts([fp3])
+    check("trailing incomplete neuron dropped (15 rows = 5 neurons x 3 layers)",
+          len(rows_tr) == 15 and counts_tr[(9, 0)] == 15)
+    layers_left = Counter(r[CSV_HEADER.index("layer_um")] for r in rows_tr)
+    check("after the drop the culture is layer-balanced", len(set(layers_left.values())) == 1)
+    tp, _ = culture_merge.merge(d, os.path.join(g, "trail_out"), make_figures=False)
+    with open(tp["hyperpolarization"], newline="") as fh:
+        check("merge() writes the same 15 kept rows", sum(1 for _ in fh) - 1 == 15)
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
 

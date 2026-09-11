@@ -25,9 +25,11 @@
 # PER-JOB IDENTITY
 #   name : <tag>_off<OFFSET>          (visible in qstat/squeue)
 #   log  : <tag>_off<OFFSET>.log      (one per job -- no clobbering)
-#   parts: parts_off<OFFSET>/         (one per job -- 'rm -rf' can't cross jobs)
-#   csv  : culture_Pactivation_off<OFFSET>.csv
+#   parts: results_<model>/parts_off<OFFSET>/   (one per job and model)
+#   csvs : results_<model>/off<OFFSET>/culture_P*.csv
 #   Combine every job's output at the end with: bash jobs/merge_all.sh
+#   <model> = config.cell_model, passed to each job as EXPECT_MODEL. Existing parts
+#   holding data are never overwritten unless OVERWRITE=1 (checked before submitting).
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
@@ -39,12 +41,22 @@ TAG="${5:-culture}"
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
+source jobs/results_layout.sh
+MODEL="$(cfg_cell_model)"
 
 PER_CORE=$(( (CULT_PER_JOB + CORES - 1) / CORES ))
 echo "jobs              : $N_JOBS"
 echo "cultures per job  : $CULT_PER_JOB"
 echo "cores per job     : $CORES   (~$PER_CORE culture(s) per core)"
 echo "TOTAL cultures    : $((N_JOBS * CULT_PER_JOB))"
+echo "cell model        : $MODEL  -> results_${MODEL}/"
+for ((k=0; k<N_JOBS; k++)); do
+    if parts_have_data "results_${MODEL}/parts_off$((k * CULT_PER_JOB))" && [ "${OVERWRITE:-0}" != "1" ]; then
+        echo "FATAL: results_${MODEL}/parts_off$((k * CULT_PER_JOB))/ already holds data;" \
+             "set OVERWRITE=1 to replace it." >&2
+        exit 1
+    fi
+done
 if [ $((CULT_PER_JOB % CORES)) -ne 0 ]; then
     echo "note: $CULT_PER_JOB is not a multiple of $CORES -- some cores get one culture"
     echo "      more than others (still fully used, just slightly unbalanced)."
@@ -66,12 +78,12 @@ for ((k=0; k<N_JOBS; k++)); do
     if [ "$SCHED" = "pbs" ]; then
         JID=$(qsub -N "$NAME" -o "$LOG" \
                    -l "nodes=1:ppn=${CORES}" \
-                   -v "CULTURE_OFFSET=${OFFSET},NCULT=${CULT_PER_JOB},NPROC=${CORES}" \
+                   -v "CULTURE_OFFSET=${OFFSET},NCULT=${CULT_PER_JOB},NPROC=${CORES},EXPECT_MODEL=${MODEL},OVERWRITE=${OVERWRITE:-0}" \
                    jobs/parallel.pbs)
     elif [ "$SCHED" = "slurm" ]; then
         JID=$(sbatch --job-name="$NAME" --output="$LOG" \
                      --cpus-per-task="${CORES}" \
-                     --export="ALL,CULTURE_OFFSET=${OFFSET},NCULT=${CULT_PER_JOB},NPROC=${CORES}" \
+                     --export="ALL,CULTURE_OFFSET=${OFFSET},NCULT=${CULT_PER_JOB},NPROC=${CORES},EXPECT_MODEL=${MODEL},OVERWRITE=${OVERWRITE:-0}" \
                      --parsable jobs/parallel.slurm)
     else
         echo "FATAL: unknown scheduler '$SCHED' (use 'pbs' or 'slurm')" >&2

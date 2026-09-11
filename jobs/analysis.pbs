@@ -1,0 +1,153 @@
+#!/bin/bash
+# ---------------------------------------------------------------------------
+# PBS/Torque -- ANALYSIS of the culture campaign (no new simulations).
+#
+#   1) ONE merge of the parts -> a frozen snapshot. Safe while simulation jobs are still
+#      running: parts are only read, and a row cut mid-write is dropped.
+#   2) In parallel, all from that same snapshot:
+#        activation        statistics + P map          -> stats/activation, maps/
+#        depol / hyperpol  statistics + P map, once per |DeltaV_end| threshold
+#                                                      -> stats/dv_<T>mV/<outcome>, maps/dv_<T>mV/
+#        Vm movie (labels at DV_MAIN)                  -> vm_movie.mp4 (or .gif without ffmpeg)
+#
+# With 3 thresholds that is 15 independent tasks, so ppn=16: more cores would sit idle
+# (48 queues longer and finishes no sooner). Each task gets (cores / tasks) numpy threads.
+#
+# Submit from the pipeline folder:   qsub jobs/analysis.pbs
+# Options, comma-separated:          qsub -v DEDUPE=1,MOVIE=0 jobs/analysis.pbs
+#   PARTS=...    parts folders to merge      (default: results_<cell_model>/parts_*)
+#   MERGED=...   reuse an existing merged folder instead of merging again
+#   DV_THRESHOLDS=0.5:1:2   |DeltaV_end| thresholds in mV, colon-separated (0 = sign only)
+#   DV_MAIN=1    threshold used for the movie's labels
+#   OUT=...      output folder               (default: analysis/<cell_model>_<date>_<time>)
+#   DEDUPE=1     --dedupe-identical in the statistics (only for batches sharing seeds)
+#   MOVIE=0      skip the Vm movie
+#   DIST_BIN, ANGLE_BIN, ORIENT_BIN, XY_BIN   statistics bins (default 5, 5, 5, 10)
+# ---------------------------------------------------------------------------
+#PBS -N estim_analysis
+#PBS -l nodes=1:ppn=16
+#PBS -l walltime=04:00:00
+#PBS -q cpu
+#PBS -j oe
+#PBS -o logs/estim_analysis.log
+
+set -euo pipefail
+
+REPO=""
+for cand in "${PBS_O_WORKDIR:-}" "${PBS_O_WORKDIR:-}/.." "$PWD" "$PWD/.." "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)"; do
+    if [ -n "$cand" ] && [ -f "$cand/culture_export.py" ]; then
+        REPO="$(cd "$cand" && pwd)"; break
+    fi
+done
+if [ -z "$REPO" ]; then echo "FATAL: repo not found" >&2; exit 1; fi
+cd "$REPO"
+
+source jobs/env_setup.sh
+source jobs/results_layout.sh
+
+MODEL="${MODEL:-$(cfg_cell_model)}"
+PARTS="${PARTS:-results_${MODEL}/parts_*}"
+OUT="${OUT:-analysis/${MODEL}_$(date +%Y%m%d_%H%M)}"
+NP="${PBS_NUM_PPN:-${PBS_NP:-$(nproc)}}"
+LOGS="$OUT/logs"
+mkdir -p "$LOGS"
+
+echo "model  : $MODEL"
+echo "parts  : $PARTS"
+echo "output : $OUT"
+echo "cores  : $NP"
+echo "---------------------------------------------------------------"
+
+# ---------------- 1) one frozen merge (or reuse one) ----------------
+T0=$SECONDS
+if [ -n "${MERGED:-}" ]; then
+    if [ ! -f "$MERGED/culture_Pactivation.csv" ]; then
+        echo "FATAL: MERGED=$MERGED has no culture_Pactivation.csv" >&2; exit 1
+    fi
+    echo "[1/2] reusing merged folder $MERGED"
+else
+    MERGED="$OUT/merged"
+    echo "[1/2] merging ..."
+    if ! python culture_merge.py --parts "$PARTS" --out-dir "$MERGED" --no-figures \
+            --expect-model "$MODEL" > "$LOGS/merge.log" 2>&1; then
+        echo "FATAL: merge failed -- last lines of $LOGS/merge.log:" >&2
+        tail -20 "$LOGS/merge.log" >&2
+        exit 1
+    fi
+    grep -E "^\[merge\] (model|[0-9]+ rows)|NOTE" "$LOGS/merge.log" || true
+    echo "      merge took $((SECONDS - T0)) s"
+fi
+
+# ---------------- 2) independent tasks in parallel ----------------
+OUTCOMES=()
+for o in activation depolarization hyperpolarization; do
+    if [ -f "$MERGED/culture_P${o}.csv" ]; then OUTCOMES+=("$o"); fi
+done
+IFS=':' read -r -a THRS <<< "${DV_THRESHOLDS:-0.5:1:2}"
+DV_MAIN="${DV_MAIN:-1}"
+STATS_EXTRA=()
+if [ "${DEDUPE:-0}" = "1" ]; then STATS_EXTRA+=(--dedupe-identical); fi
+BINS=(--distance-bin "${DIST_BIN:-5}" --angle-bin "${ANGLE_BIN:-5}"
+      --orientation-bin "${ORIENT_BIN:-5}" --xy-bin "${XY_BIN:-10}")
+DO_MOVIE=0
+if [ "${MOVIE:-1}" = "1" ] && [ "$MODEL" = "soma_only" ] && [ "${#OUTCOMES[@]}" -eq 3 ]; then
+    DO_MOVIE=1
+fi
+if command -v ffmpeg >/dev/null 2>&1; then EXT=mp4; else EXT=gif; fi
+
+NTASK=$DO_MOVIE
+for o in "${OUTCOMES[@]}"; do
+    if [ "$o" = "activation" ]; then NTASK=$((NTASK + 2)); else NTASK=$((NTASK + 2 * ${#THRS[@]})); fi
+done
+THREADS=$(( NP / NTASK )); if [ "$THREADS" -lt 1 ]; then THREADS=1; fi
+export OMP_NUM_THREADS=$THREADS OPENBLAS_NUM_THREADS=$THREADS MKL_NUM_THREADS=$THREADS
+echo "[2/2] $NTASK tasks in parallel (outcomes: ${OUTCOMES[*]}; |DeltaV| thresholds: ${THRS[*]} mV; movie: $DO_MOVIE), $THREADS thread(s) each"
+
+NAMES=()
+declare -A PIDS
+launch() {                     # launch NAME CMD... : run in the background, own log
+    local name=$1; shift
+    "$@" > "$LOGS/$name.log" 2>&1 &
+    PIDS[$name]=$!
+    NAMES+=("$name")
+}
+for o in "${OUTCOMES[@]}"; do
+    if [ "$o" = "activation" ]; then
+        launch "stats_$o" python culture_statistics.py --input "$MERGED" --output "$OUT/stats" \
+            --outcome "$o" "${BINS[@]}" ${STATS_EXTRA[@]+"${STATS_EXTRA[@]}"}
+        launch "maps_$o" python culture_maps.py --input "$MERGED" --outcome "$o" --out-dir "$OUT/maps"
+    else
+        for t in "${THRS[@]}"; do
+            launch "stats_${o}_dv${t}" python culture_statistics.py --input "$MERGED" \
+                --output "$OUT/stats/dv_${t}mV" --outcome "$o" --dv-threshold "$t" "${BINS[@]}" \
+                ${STATS_EXTRA[@]+"${STATS_EXTRA[@]}"}
+            launch "maps_${o}_dv${t}" python culture_maps.py --input "$MERGED" --outcome "$o" \
+                --dv-threshold "$t" --out-dir "$OUT/maps/dv_${t}mV"
+        done
+    fi
+done
+if [ "$DO_MOVIE" = "1" ]; then
+    launch movie python culture_vm_animation.py --input "$MERGED" --dv-threshold "$DV_MAIN" \
+        --output "$OUT/vm_movie_dv${DV_MAIN}mV.$EXT"
+fi
+
+FAIL=0
+for name in "${NAMES[@]}"; do
+    if wait "${PIDS[$name]}"; then
+        echo "  OK    $name"
+    else
+        rc=$?
+        echo "  FAIL  $name (exit $rc) -- last lines of $LOGS/$name.log:"
+        tail -5 "$LOGS/$name.log" | sed 's/^/        /'
+        FAIL=1
+    fi
+done
+
+echo "---------------------------------------------------------------"
+echo "total $((SECONDS - T0)) s. Figures:"
+find "$OUT" \( -name "*.pdf" -o -name "*.mp4" -o -name "*.gif" \) | sort | sed 's/^/  /'
+if [ "$FAIL" -ne 0 ]; then
+    echo "FAILED: see $LOGS/" >&2
+    exit 1
+fi
+echo "done: $OUT"

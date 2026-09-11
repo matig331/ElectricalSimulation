@@ -1,19 +1,30 @@
 """culture_worker.py -- SIMULATION ONLY. Runs an assigned subset of cultures.
 
-One worker = one OS process = one core. It builds the 9 (morphology x layer) cells
-ONCE, then runs every culture it was assigned, appending to its own partial CSV.
-No plotting, no merging: culture_merge.py does that.
+One worker = one OS process = one core. It runs every culture it was assigned and appends
+to its own partial CSV (schema: culture_export.CSV_HEADER). No plotting, no merging:
+culture_merge.py does that.
+
+WHAT IT SIMULATES
+    Exactly what the serial culture_export() simulates, through the SAME shared core
+    (culture_export.CellPool + iter_culture_blocks + build_row): the cell model is
+    config.cell_model ("soma_only" for the final dataset), every row records it, and each
+    simulation is classified activation / depolarization / hyperpolarization / neutral from
+    DeltaV_end = Vm(end of phase 2) - Vm_sham(end of phase 2). See culture_export's docstring.
 
 WHY THE SPLIT IS EXACT, NOT JUST STATISTICALLY EQUIVALENT
-    culture_export() seeds each culture independently:  rng = default_rng(seed + c).
-    The draws for culture c therefore depend ONLY on (seed, c), never on how many
-    cultures ran before it or in what order. Running culture 7 alone reproduces
+    Every culture is seeded independently:  rng = default_rng(seed + c)
+    (culture_export.culture_draws). The draws for culture c depend ONLY on (seed, c), never on
+    how many cultures ran before it or in what order. Running culture 7 alone reproduces
     culture 7 of a serial run bit for bit, for a given seed.
 
-WHY WHOLE CULTURES AND NOT INDIVIDUAL NEURONS
-    Building the cells (slicing + Import3d + d_lambda on large .asc trees) is a fixed
-    cost B paid once per PROCESS, not per culture. Splitting at the neuron level would
-    force every core to pay B while giving each fewer simulations to amortise it over.
+ONE LIVE CELL, BLOCKS OF NEURONS
+    NEURON integrates every section that exists; keeping all morphology x layer cells alive
+    (the previous design) made every simulation ~6x slower for identical results. CellPool
+    keeps one live cell and rebuilds from a cached slice (~0.1-0.2 s, bit-identical). To keep
+    rebuilds rare, neurons are processed in blocks of --flush-every neurons, grouped by
+    (morphology, layer) inside the block; rows are still written NEURON-major and the file is
+    flushed + fsync'ed after every block, so a culture cut short by the walltime is an
+    unbiased random subset of COMPLETE neurons (all layers each).
 
 TWO WAYS TO GET MORE CULTURES WITHOUT OVERLAP -- pick ONE per set of jobs, don't mix:
   (a) SAME seed, DIFFERENT culture-index ranges (--ids 0-19 vs --ids 20-39). This is
@@ -22,8 +33,10 @@ TWO WAYS TO GET MORE CULTURES WITHOUT OVERLAP -- pick ONE per set of jobs, don't
       replicates. Each row records which seed produced it (the CSV 'seed' column), so
       culture_merge.py can tell "same seed, same culture" (a true duplicate, rejected)
       apart from "different seed, same LOCAL culture index" (a legitimate independent
-      replicate, allowed and remapped to its own global id for correct per-culture
-      statistics). See jobs/submit_seeded.sh.
+      replicate, allowed and remapped to its own global id). See jobs/submit_seeded.sh.
+  Reusing the seeds of the full-active campaign places the somata exactly where that
+  campaign placed them (paired comparison); the outputs live in separate results_<model>/
+  folders, so nothing is overwritten or mixed.
 
 USAGE
     python culture_worker.py --ids 0,3,6,9 --out parts/part_00.csv
@@ -34,8 +47,7 @@ USAGE
 import argparse
 import csv
 import os
-
-import numpy as np
+import time
 
 from culture_export import CSV_HEADER   # single source of truth for the schema
 
@@ -83,29 +95,27 @@ def run_worker(culture_ids, out_csv, neurons_per_culture=None, layers=None,
                flush_every=25, quiet=False):
     """Simulate the given cultures and write one partial CSV. Returns the CSV path.
 
-    Mirrors culture_export()'s inner loop exactly (same seeding, same column order),
-    minus the plotting. `seed`: None -> use config.seed (offset-split jobs, the usual
-    case); an explicit int -> an independent replicate run (see jobs/submit_seeded.sh).
-    Either way the seed actually used is recorded in every row's 'seed' column.
+    `seed`: None -> config.seed (offset-split jobs); an explicit int -> an independent
+    replicate run (jobs/submit_seeded.sh). The seed actually used is in every row.
+    `flush_every`: neurons per block (= flush + fsync interval). `distance_mode` is accepted
+    for API compatibility only (every distance metric is written to the CSV).
     """
     from config import CFG
-    from morphologies import find_one_morphology
-    from slicer import reduced_asc
-    from rich_cell import build_rich_cell
-    from rich_footprint import spikes_at
-    from culture_export import (assign_morphologies, dist_from_nearest_electrode,
-                                dist_from_center, directional_rt, rel_orientation_deg,
-                                electrode_center, dipole_axis_deg, dipole_frame)
+    from culture_export import (CellPool, culture_draws, iter_culture_blocks,
+                                resolve_cell_model, electrode_center, dipole_axis_deg,
+                                dipole_frame)
     import field as F
 
     cfg = CFG
+    flush_every = int(flush_every)
+    if flush_every < 1:
+        raise ValueError("flush_every must be >= 1, got %d" % flush_every)
     seed_used = cfg.seed if seed is None else int(seed)
+    cell_model = resolve_cell_model(cfg)
     N = cfg.n_neurons_effective() if neurons_per_culture is None else int(neurons_per_culture)
-    layers = layers or cfg.layers_um
+    layers = list(layers or cfg.layers_um)
     span = cfg.span_half_um() if span_um is None else float(span_um)
     i0 = cfg.i0_uA if i0_uA is None else float(i0_uA)
-    distance_mode = (getattr(cfg, "culture_distance_mode", "centroid")
-                     if distance_mode is None else distance_mode)
     n_pulses = cfg.n_pulses_for_duration()
     morphs = cfg.morphologies
     M = len(morphs)
@@ -114,68 +124,52 @@ def run_worker(culture_ids, out_csv, neurons_per_culture=None, layers=None,
     center = electrode_center(elec)
     axis = dipole_axis_deg(elec, sign)
     dip_c, dip_d = dipole_frame(elec, sign)
+    pid = os.getpid()
 
     if not quiet:
         n_sim = len(culture_ids) * N * len(layers)
-        print("[worker pid=%d] seed=%d cultures %s | %d neurons x %d layers = %d sims @ %.0f uA"
-              % (os.getpid(), seed_used, culture_ids, N, len(layers), n_sim, i0), flush=True)
-
-    # Build once per (morphology, layer) -- the fixed cost this whole design amortises.
-    cells = {}
-    for layer in layers:
-        for m in morphs:
-            tag = "_cw%d_%s_%d.asc" % (os.getpid(), m, int(layer))   # pid-tagged: no clash
-            asc = reduced_asc(find_one_morphology(m), layer, out_path=tag)
-            cells[(m, layer)] = build_rich_cell(asc)
-            if asc and os.path.exists(asc):
-                os.remove(asc)
-    if not quiet:
-        print("[worker pid=%d] %d cells built" % (os.getpid(), len(cells)), flush=True)
+        print("[worker pid=%d] model=%s seed=%d cultures %s | %d neurons x %d layers = %d sims "
+              "@ %.0f uA | block/flush every %d neurons"
+              % (pid, cell_model, seed_used, culture_ids, N, len(layers), n_sim, i0,
+                 flush_every), flush=True)
 
     d_out = os.path.dirname(os.path.abspath(out_csv))
     if d_out and not os.path.isdir(d_out):
         os.makedirs(d_out, exist_ok=True)
 
-    with open(out_csv, "w", newline="") as fh:
-        w = csv.writer(fh)
-        w.writerow(CSV_HEADER)
-        for c in culture_ids:
-            rng = np.random.default_rng(seed_used + c)   # IDENTICAL rule to culture_export()
-            midx = assign_morphologies(N, M, rng)
-            pos = rng.uniform(-span, span, size=(N, 2))
-            theta = rng.uniform(0, 360, size=N)
-            d_near = dist_from_nearest_electrode(pos, elec)
-            d_cen = dist_from_center(pos, center)
-            r_dip, th_pos = directional_rt(pos, dip_c, dip_d, z_um=cfg.h_soma_um)
-            th_or = rel_orientation_deg(theta, axis)
-            # NEURON-MAJOR (not layer-major) on purpose: each neuron is written with
-            # all its layers together, so a culture cut short by the walltime is an
-            # unbiased random SUBSET OF NEURONS rather than a layer-40-only sample.
-            # The set of rows is identical either way -- only the order changes.
-            for i in range(N):
-                for layer in layers:                     # SAME placement, vary layer
-                    fired = int(spikes_at(cells[(morphs[midx[i]], layer)],
-                                          (float(pos[i, 0]), float(pos[i, 1])),
-                                          float(theta[i]), i0_uA=i0)[0] > 0)
-                    w.writerow([c, i, morphs[midx[i]], int(layer),
-                                round(float(pos[i, 0]), 2), round(float(pos[i, 1]), 2),
-                                round(float(d_near[i]), 2), round(float(d_cen[i]), 2),
-                                round(float(r_dip[i]), 2), round(float(th_or[i]), 1),
-                                round(float(th_pos[i]), 1), n_pulses, round(i0, 1), fired,
-                                seed_used])
-                # flush() alone only reaches the LOCAL node's page cache; on a shared
-                # filesystem the login node can still see size 0. fsync() forces it out
-                # so progress is visible (and durable) from anywhere, immediately.
-                if (i + 1) % flush_every == 0 or i == N - 1:
+    with CellPool(cfg, cell_model) as pool:
+        # rest + sham of every (morphology, layer) once, up front: visible at the top of the log
+        for layer in layers:
+            for m in morphs:
+                p = pool.info(m, layer)
+                if not quiet:
+                    print("[worker pid=%d] %s L%d um: v_rest %.4f mV | sham drift at end of "
+                          "phase 2 %+.6f mV" % (pid, m, int(layer), p["v_rest"], p["ctrl_drift"]),
+                          flush=True)
+        with open(out_csv, "w", newline="") as fh:
+            w = csv.writer(fh)
+            w.writerow(CSV_HEADER)
+            fh.flush()
+            os.fsync(fh.fileno())
+            for c in culture_ids:
+                d = culture_draws(seed_used, c, N, M, span, elec, center, dip_c, dip_d, axis,
+                                  cfg.h_soma_um)
+                t0 = time.time()
+                for rows, n_done in iter_culture_blocks(pool, c, d, morphs, layers, i0,
+                                                        n_pulses, seed_used, flush_every):
+                    w.writerows(rows)
+                    # flush() alone only reaches the LOCAL node's page cache; on a shared
+                    # filesystem the login node can still see size 0. fsync() forces it out
+                    # so progress is visible (and durable) from anywhere, immediately.
                     fh.flush()
                     os.fsync(fh.fileno())
                     if not quiet:
-                        print("[worker pid=%d] culture %d: %d/%d neurons"
-                              % (os.getpid(), c, i + 1, N), flush=True)
-            fh.flush()
-            os.fsync(fh.fileno())
-            if not quiet:
-                print("[worker pid=%d] culture %d done" % (os.getpid(), c), flush=True)
+                        dt = time.time() - t0
+                        print("[worker pid=%d] culture %d: %d/%d neurons | %.2f s/sim | %d builds"
+                              % (pid, c, n_done, N, dt / max(1, n_done * len(layers)),
+                                 pool.n_builds), flush=True)
+                if not quiet:
+                    print("[worker pid=%d] culture %d done" % (pid, c), flush=True)
     return out_csv
 
 
@@ -195,10 +189,12 @@ def main():
                     help="label only, for log messages -- not written to the CSV (the 'seed' "
                          "column is what makes a row's provenance unambiguous)")
     ap.add_argument("--flush-every", type=int, default=25,
-                    help="flush+fsync every N neurons (default 25). Lower = more frequent\n"
-                         "partial saves and progress visible sooner; each fsync costs a little I/O.")
+                    help="neurons per block = flush+fsync interval (default 25). Larger = fewer "
+                         "cell rebuilds, progress visible less often.")
     ap.add_argument("--quiet", action="store_true")
     a = ap.parse_args()
+    if a.flush_every < 1:
+        ap.error("--flush-every must be >= 1")
     if a.job_name and not a.quiet:
         print("[worker pid=%d] job-name=%s" % (os.getpid(), a.job_name), flush=True)
     run_worker(parse_ids(a.ids), a.out, neurons_per_culture=a.neurons,

@@ -1,3 +1,7 @@
+> **Culture export (soma-only, three outcomes): see HPC_RUN_COMPLETE.md** -- it supersedes the
+> culture_export / merge commands below (outputs now go to results_<model>/, merge takes
+> --out-dir). The nrnivmodl and environment notes below still apply.
+
 # HPC run guide -- in-silico extracellular stimulation pipeline
 
 This guide explains, in order, **what to configure** and **which commands to run** on the cluster.

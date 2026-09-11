@@ -63,6 +63,6 @@ print("full run at YOUR current config.py: %.1f h  -> request %.0f h walltime (2
       % (h, max(1, round(2*h))))
 PY
 echo "---------------------------------------------------------------"
-wc -l dryrun_Pactivation.csv
+wc -l dryrun_Pactivation.csv dryrun_Pdepolarization.csv dryrun_Phyperpolarization.csv
 head -2 dryrun_Pactivation.csv
 echo "dry run finished: $(date)"

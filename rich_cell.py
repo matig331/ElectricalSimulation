@@ -15,6 +15,12 @@ Domains (by section name): soma / apic (apical) / dend (basal) / axon (AIS).
   R3 dend  : Ih only, uniform = somatic value
   R4 axon  : Eyal na(200)/kv(100) on the AIS  (Rich = passive; kept per request)
 
+Modes of build_rich_cell(asc, passive_only=False, soma_only=False):
+  default      : R0-R4 above (the full-active model of the preliminary campaign).
+  soma_only    : R0 everywhere + R1 on the soma ONLY; apical, basal and the stylized
+                 axon/AIS stay passive (pas only). This is config.cell_model = "soma_only".
+  passive_only : R0 only (control).
+
 Segmentation: d_lambda (lambda_f=100 Hz).  ENa=+50, EK=-85 (Rich K), ek=-90 (Eyal kv);
 shift_NaTa_t=5, shift_SKv3_1=10.
 
@@ -74,8 +80,10 @@ def _gbar(seg, suffix, value):
     setattr(seg, f"g{suffix}bar_{suffix}", value)
 
 
-def build_rich_cell(asc_path):
+def build_rich_cell(asc_path, passive_only=False, soma_only=False):
     _load()
+    if passive_only and soma_only:
+        raise ValueError("Choose either passive_only=True or soma_only=True, not both")
     cell = getattr(h, TEMPLATE)()
     nl = h.Import3d_Neurolucida3(); nl.input(asc_path)
     h.Import3d_GUI(nl, 0).instantiate(cell)
@@ -115,6 +123,17 @@ def build_rich_cell(asc_path):
 
         if "soma" in name:
             sec.cm = 1.0
+
+        # Passive-only control: keep only pas + membrane capacitance.
+        if passive_only:
+            continue
+
+        # Soma-only active model: retain the full Rich active channel set ONLY in soma.
+        # Apical/basal dendrites and the stylized axon remain passive.
+        if soma_only and "soma" not in name:
+            continue
+
+        if "soma" in name:
             for m in ("NaTa_t", "Nap_Et2", "K_Pst", "K_Tst", "SKv3_1", "SK_E2",
                       "Ca_LVAst", "Ca_HVA", "Ih", "CaDynamics_E2"):
                 sec.insert(m)
@@ -159,31 +178,53 @@ def build_rich_cell(asc_path):
             for seg in sec:
                 seg.gbar_na = 200.0
                 seg.gbar_kv = 100.0
-    # apply channel multipliers (config) -- _apply channel multipliers
-    try:
-        from config import CFG as _CFG
-        _km = float(getattr(_CFG, "k_soma_mult", 1.0) or 1.0)
-        _nm = float(getattr(_CFG, "ais_na_mult", 1.0) or 1.0)
-        _vm = float(getattr(_CFG, "ais_kv_mult", 1.0) or 1.0)
-        _sn = float(getattr(_CFG, "na_soma_mult", 1.0) or 1.0)
-    except Exception:
-        _km = _nm = _vm = _sn = 1.0
-    if any(x != 1.0 for x in (_km, _nm, _vm, _sn)):
-        for sec in cell.all:
-            _n = sec.name()
-            for seg in sec:
-                if ("soma" in _n or "apic" in _n):
-                    if _km != 1.0 and h.ismembrane("SKv3_1", sec=sec):
-                        seg.gSKv3_1bar_SKv3_1 *= _km
-                    if _sn != 1.0 and h.ismembrane("NaTa_t", sec=sec):
-                        seg.gNaTa_tbar_NaTa_t *= _sn
-                if "axon" in _n:
-                    if _nm != 1.0 and h.ismembrane("na", sec=sec):
-                        seg.gbar_na *= _nm
-                    if _vm != 1.0 and h.ismembrane("kv", sec=sec):
-                        seg.gbar_kv *= _vm
+    # Apply channel multipliers to whichever active compartments actually exist.
+    if not passive_only:
+        try:
+            from config import CFG as _CFG
+            _km = float(getattr(_CFG, "k_soma_mult", 1.0) or 1.0)
+            _nm = float(getattr(_CFG, "ais_na_mult", 1.0) or 1.0)
+            _vm = float(getattr(_CFG, "ais_kv_mult", 1.0) or 1.0)
+            _sn = float(getattr(_CFG, "na_soma_mult", 1.0) or 1.0)
+        except Exception:
+            _km = _nm = _vm = _sn = 1.0
+        if any(x != 1.0 for x in (_km, _nm, _vm, _sn)):
+            for sec in cell.all:
+                _n = sec.name()
+                for seg in sec:
+                    if ("soma" in _n or "apic" in _n):
+                        if _km != 1.0 and h.ismembrane("SKv3_1", sec=sec):
+                            seg.gSKv3_1bar_SKv3_1 *= _km
+                        if _sn != 1.0 and h.ismembrane("NaTa_t", sec=sec):
+                            seg.gNaTa_tbar_NaTa_t *= _sn
+                    if "axon" in _n:
+                        if _nm != 1.0 and h.ismembrane("na", sec=sec):
+                            seg.gbar_na *= _nm
+                        if _vm != 1.0 and h.ismembrane("kv", sec=sec):
+                            seg.gbar_kv *= _vm
 
     return cell
+
+
+def settled_resting_voltage(cell, tstop_ms=1500.0, dt_ms=0.025, v_init_mV=-85.0):
+    """Return the no-stimulus settled somatic Vm for this exact cell model.
+
+    Useful for reduced biophysics (e.g. soma-only active), whose equilibrium need not
+    equal the full-model cfg.v_rest_mV or the pure-passive e_pas. This is intended to
+    be called ONCE per cached morphology x layer, not once per neuron placement.
+    """
+    h.celsius = 37
+    h.dt = float(dt_ms)
+    h.tstop = float(tstop_ms)
+    vs = h.Vector().record(cell.soma[0](0.5)._ref_v)
+    # NOTE: no h.cvode.use_fast_imem(1) here. Nothing reads i_membrane_, and the flag is
+    # GLOBAL: left on, it made every later stimulation ~5% slower (measured).
+    h.finitialize(float(v_init_mV))
+    h.continuerun(float(tstop_ms))
+    v = np.asarray(vs, dtype=float)
+    if v.size == 0:
+        raise RuntimeError("Could not determine settled resting voltage")
+    return float(v[-1])
 
 
 def resting_check(cell, tstop_ms=100.0, dt_ms=0.025):
@@ -209,7 +250,7 @@ if __name__ == "__main__":
     from morphologies import find_one_morphology
     from slicer import reduced_asc
     asc = reduced_asc(find_one_morphology("60308"), 120.0, out_path="_rich.asc")
-    cell = build_rich_cell(asc)
+    cell = build_rich_cell(asc, soma_only=True)
     nseg = sum(s.nseg for s in cell.all)
     v = resting_check(cell)
     print(f"Rich cell | {nseg} segments | Vm(0)={v[0]:.2f} -> Vm(100ms)={v[-1]:.2f} mV | "

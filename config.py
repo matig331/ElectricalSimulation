@@ -14,6 +14,13 @@ class WellConfig:
     # --- morphologies (specimen tags found in the Eyal bundle) -------------
     morphologies: List[str] = field(default_factory=lambda: ["60308", "130303", "60303", "60311", "130305", "130306"])
     model: str = "rich"                 # "rich" (human L5) or "eyal" (na/kv)
+    # --- culture-export biophysics (THE model switch; recorded in every CSV row) ----
+    #   "soma_only"   : soma = full Rich active set; dendrites + stylized axon/AIS PASSIVE;
+    #                   v_init = settled rest of each morphology x layer (the FINAL dataset).
+    #   "full_active" : Rich + active Eyal AIS, v_init = v_rest_mV (the preliminary dataset).
+    # Results go to results_<cell_model>/ -- the two models are never written, merged or
+    # analysed together (culture_merge.py and culture_statistics.py refuse to pool them).
+    cell_model: str = "soma_only"
 
     # --- electrodes (3Brain HyperCAM / CorePlate) --------------------------
     pitch_um: float = 60.0
@@ -103,7 +110,9 @@ class WellConfig:
     # --- stimulation DURATION (statistics over >= 1 min) --------------------
     # The lab delivers 3 min at 0.2 Hz. For the per-culture statistic the reviewer wants
     # >= 1 min delivered. Duration -> number of pulses via the frequency.
-    stim_duration_s: float = 80.0  # total stimulation epoch (s); lab = 180 s (3 min)
+    stim_duration_s: float = 10.0  # total stimulation epoch (s); lab = 180 s (3 min).
+    #   Annotation only: sets the n_pulses CSV column (180 s x 0.2 Hz = 36); the simulation
+    #   itself is ONE pulse either way (pulses at 0.2 Hz are independent).
 
     # --- before/during/after sweep (bda) -----------------------------------
     # kept for reference; bda now also uses n_samples random positions (orient random per pos).

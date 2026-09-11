@@ -16,6 +16,19 @@
 #      so you don't have to edit those files per submission. Unset -> whatever the
 #      job script already specifies.
 #      QUEUE    = queue/partition override, e.g. QUEUE=long
+#      OVERWRITE=1 = allow re-using a name whose results_<model>/parts_<name>/
+#                 already holds data (default: refuse BEFORE submitting anything)
+#      FLUSH_EVERY = neurons per flush+fsync block (default: 25, same as calling
+#                 run_parallel.sh directly with nothing set -- this only needs to be
+#                 set explicitly to CHANGE it)
+#      NEURONS_PER_CULTURE = TIMING-ONLY override, small (e.g. 20) -- for a concurrency
+#                 dry run through the real scheduler, NOT for an actual campaign (see
+#                 run_parallel.sh and HPC_RUN_COMPLETE.md, "Walltime")
+#
+# MODEL: taken from config.cell_model at submission and passed to every job as
+#      EXPECT_MODEL, so a job refuses to start if config.py changed while it queued.
+#      Outputs go to results_<model>/ (see jobs/results_layout.sh); each job logs to
+#      logs/<model>_<name>.log (one log per job -- they used to share one file).
 #
 # EXAMPLE -- your 4 jobs, different name and seed:
 #   bash jobs/submit_seeded.sh 20 48 pbs run1:1000 run2:2000 run3:3000 run4:4000
@@ -26,11 +39,11 @@
 #
 # Each job gets its own PBS/SLURM job name (qsub -N / sbatch --job-name,
 # which overrides the #PBS -N / #SBATCH --job-name line already in the
-# script), its own parts_<name>/ directory, and its own
-# culture_Pactivation_<name>.csv -- so none of the 4 can collide or clobber
-# another, whether they run sequentially or genuinely at the same time.
+# script), its own results_<model>/parts_<name>/ directory and its own
+# results_<model>/<name>/ outputs -- so none can collide or clobber another,
+# whether they run sequentially or genuinely at the same time.
 #
-# Once all 4 have finished:  bash jobs/merge_all.sh
+# Once ALL have finished (or hit the walltime):  bash jobs/merge_all.sh
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
@@ -45,10 +58,14 @@ fi
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
+source jobs/results_layout.sh
+MODEL="$(cfg_cell_model)"
 
 echo "Submitting $# named replicate job(s), $CULT_PER_JOB cultures each, $CORES cores each ($SCHED)."
+echo "cell model: $MODEL  -> results_${MODEL}/ , logs in logs/"
 echo
 
+# ---- guards for EVERY name before the FIRST submission ---------------------------
 declare -A SEEN_NAMES SEEN_SEEDS
 for pair in "$@"; do
     NAME="${pair%%:*}"
@@ -65,28 +82,43 @@ for pair in "$@"; do
         exit 1
     fi
     SEEN_NAMES[$NAME]=1; SEEN_SEEDS[$SEED]=$NAME
+    if parts_have_data "results_${MODEL}/parts_${NAME}" && [ "${OVERWRITE:-0}" != "1" ]; then
+        echo "FATAL: results_${MODEL}/parts_${NAME}/ already holds data -- a job named" \
+             "'$NAME' would delete it. Pick a new name, or set OVERWRITE=1." >&2
+        exit 1
+    fi
+done
+mkdir -p logs
+
+# ---- submit ----------------------------------------------------------------------
+for pair in "$@"; do
+    NAME="${pair%%:*}"
+    SEED="${pair#*:}"
+    LOG="logs/${MODEL}_${NAME}.log"
+    VARS="JOB_SEED=${SEED},JOB_NAME=${NAME},NCULT=${CULT_PER_JOB},NPROC=${CORES},EXPECT_MODEL=${MODEL},OVERWRITE=${OVERWRITE:-0},FLUSH_EVERY=${FLUSH_EVERY:-25}"
+    [ -n "${NEURONS_PER_CULTURE:-}" ] && VARS="${VARS},NEURONS_PER_CULTURE=${NEURONS_PER_CULTURE}"
 
     if [ "$SCHED" = "pbs" ]; then
         EXTRA=()
         [ -n "${WALLTIME:-}" ] && EXTRA+=(-l "walltime=${WALLTIME}")
         [ -n "${QUEUE:-}" ]    && EXTRA+=(-q "${QUEUE}")
-        JID=$(qsub -N "$NAME" "${EXTRA[@]}" \
+        JID=$(qsub -N "$NAME" ${EXTRA[@]+"${EXTRA[@]}"} -o "$LOG" \
                     -l "nodes=1:ppn=${CORES}" \
-                    -v "JOB_SEED=${SEED},JOB_NAME=${NAME},NCULT=${CULT_PER_JOB},NPROC=${CORES}" \
+                    -v "$VARS" \
                     jobs/parallel.pbs)
     elif [ "$SCHED" = "slurm" ]; then
         EXTRA=()
         [ -n "${WALLTIME:-}" ] && EXTRA+=(--time="${WALLTIME}")
         [ -n "${QUEUE:-}" ]    && EXTRA+=(--partition="${QUEUE}")
-        JID=$(sbatch --job-name="$NAME" "${EXTRA[@]}" \
+        JID=$(sbatch --job-name="$NAME" ${EXTRA[@]+"${EXTRA[@]}"} --output="$LOG" \
                      --cpus-per-task="${CORES}" \
-                     --export="ALL,JOB_SEED=${SEED},JOB_NAME=${NAME},NCULT=${CULT_PER_JOB},NPROC=${CORES}" \
+                     --export="ALL,${VARS}" \
                      --parsable jobs/parallel.slurm)
     else
         echo "FATAL: unknown scheduler '$SCHED' (use 'pbs' or 'slurm')" >&2
         exit 1
     fi
-    echo "  $NAME (seed=$SEED) -> $JID"
+    echo "  $NAME (seed=$SEED) -> $JID   log: $LOG"
 done
 
 echo
