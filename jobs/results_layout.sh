@@ -10,7 +10,8 @@
 #   merged_<model>/culture_P*.csv + PDFs       ALL jobs of that model (jobs/merge_all.sh)
 #                                              -> the input of culture_statistics.py
 #
-# <model> = config.cell_model ("soma_only" | "full_active"). One tree per model, so a
+# <model> = config.cell_model ("soma_only" | "full_active" | "full_tuned"). One tree per
+# model, so a
 # job of one model can never delete, overwrite or be merged with the other's data.
 # The preliminary full-active campaign predates this layout: its parts_run*/ dirs in
 # the repo root are left untouched (merge them with culture_merge.py directly).
@@ -19,14 +20,17 @@
 cfg_cell_model() {
     # Print config.cell_model, validated. Fails loudly: the model decides where data goes.
     local m
-    if ! m="$(python -c 'from config import CFG; print(CFG.cell_model)')"; then
+    # 2>/dev/null: config.py reports its ESTIM_* overrides on stderr, and this captures
+    # stdout only. Keep it that way -- a diagnostic leaking into $m breaks every job.
+    if ! m="$(python -c 'from config import CFG; print(CFG.cell_model)' 2>/dev/null)"; then
         echo "FATAL: could not read config.cell_model -- is the NEURON env active and" \
              "config.py up to date (it must define cell_model)?" >&2
         return 1
     fi
     case "$m" in
-        soma_only|full_active) echo "$m" ;;
-        *) echo "FATAL: config.cell_model='$m' (expected soma_only or full_active)" >&2
+        soma_only|full_active|full_tuned) echo "$m" ;;
+        *) echo "FATAL: config.cell_model='$m' (expected soma_only, full_active or"\
+                " full_tuned)" >&2
            return 1 ;;
     esac
 }

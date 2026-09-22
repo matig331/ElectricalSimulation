@@ -4,6 +4,8 @@ config.py -- single source of truth for the whole pipeline.
 Edit HERE, then run the stages in pipeline.py. The one knob you change most is
 N_NEURONS (few locally, the HPC value derived from density x area).
 """
+import os
+import sys
 from dataclasses import dataclass, field
 from typing import List, Tuple, Optional
 import numpy as np
@@ -217,3 +219,57 @@ class WellConfig:
 
 
 CFG = WellConfig()
+
+
+# --------------------------------------------------------------------------------------------
+# NARROW environment overrides, so a batch job can vary a run without editing this file (an
+# edit would race any job still sitting in the queue -- which is exactly what EXPECT_MODEL
+# exists to catch). Only the three post-pulse knobs and the layer list are overridable:
+#
+#   ESTIM_BUMP_MS        config.bump_ms
+#   ESTIM_BUMP_FRACTION  config.bump_culture_fraction
+#   ESTIM_LAYERS         config.layers_um, comma-separated um
+#
+# cell_model is deliberately NOT here. It decides which results_<model>/ tree is written and is
+# recorded in every row, so it stays a visible edit to this file, guarded by EXPECT_MODEL.
+# Every override that fires is reported on STDERR -- never stdout. jobs/results_layout.sh
+# reads config.cell_model by capturing the stdout of `python -c 'print(CFG.cell_model)'`, so
+# anything this module prints to stdout at import time is swallowed into that value and the
+# job dies with a nonsense model name. (It did, before this line was written.)
+# --------------------------------------------------------------------------------------------
+def _apply_env_overrides(cfg=CFG, env=None):
+    """Apply the ESTIM_* overrides to `cfg`. Returns the list of messages (also printed)."""
+    env = os.environ if env is None else env
+    msgs = []
+
+    def _num(name, attr, cast):
+        raw = env.get(name)
+        if raw is None or str(raw).strip() == "":
+            return
+        try:
+            val = cast(raw)
+        except (TypeError, ValueError):
+            raise SystemExit("FATAL: %s=%r is not a number" % (name, raw))
+        old_val = getattr(cfg, attr)
+        setattr(cfg, attr, val)
+        msgs.append("%s: %s -> %s  (%s)" % (attr, old_val, val, name))
+
+    _num("ESTIM_BUMP_MS", "bump_ms", float)
+    _num("ESTIM_BUMP_FRACTION", "bump_culture_fraction", float)
+    raw = env.get("ESTIM_LAYERS")
+    if raw and str(raw).strip():
+        try:
+            layers = tuple(float(x) for x in str(raw).replace(";", ",").split(",") if x.strip())
+        except ValueError:
+            raise SystemExit("FATAL: ESTIM_LAYERS=%r is not a comma-separated list of um" % raw)
+        if not layers:
+            raise SystemExit("FATAL: ESTIM_LAYERS=%r is empty" % raw)
+        msgs.append("layers_um: %s -> %s  (ESTIM_LAYERS)" % (cfg.layers_um, layers))
+        cfg.layers_um = layers
+
+    for m in msgs:
+        print("[config] override %s" % m, file=sys.stderr)
+    return msgs
+
+
+_apply_env_overrides()

@@ -1,0 +1,145 @@
+#!/bin/bash
+# ---------------------------------------------------------------------------
+# PBS/Torque -- ONE job: simulate N neurons with the full channel set, then produce EVERY
+# figure from them. Nothing to chain by hand.
+#
+#   1) fan culture_worker.py across the cores (jobs/run_parallel.sh) and merge this job's parts
+#   2) outcome statistics + P maps          -> <OUT>/stats, <OUT>/maps      (culture_statistics)
+#   3) post-pulse Ih bump statistics        -> <OUT>/bump_statistics.pdf    (plot_bump_statistics)
+#   4) a handful of example Vm traces       -> <OUT>/plot_vm_examples.pdf   (plot_vm_examples)
+#
+#   qsub jobs/full_tuned_run.pbs                       # 1000 neurons/layer, 10 cultures
+#   qsub -v NEURONS=2000,CULTURES=20 jobs/full_tuned_run.pbs
+#   qsub -v LAYERS=80 jobs/full_tuned_run.pbs          # one slice thickness instead of three
+#   qsub -v BUMP_FRACTION=0.5 jobs/full_tuned_run.pbs  # kinetics on half the cultures
+#
+# OPTIONS (comma-separated after -v)
+#   NEURONS=1000     total neurons PER LAYER. Every neuron is simulated once per layer, so the
+#                    simulation count is NEURONS x (number of layers).
+#   CULTURES=10      how many independent random cultures those neurons are split into.
+#   SEED=2000        RNG base. Use a seed no earlier job used, or the placements repeat.
+#   LAYERS=          comma-separated slice thicknesses; default config.layers_um (40,80,120).
+#   BUMP_MS=800      post-pulse window. 0 = no kinetics, and the run costs ~3x less.
+#   BUMP_FRACTION=1  fraction of CULTURES measured for kinetics (config.bump_culture_fraction).
+#   DV_THRESHOLDS=0.5:1:2   |DeltaV_end| thresholds for the depol/hyperpol statistics.
+#   NAME=            tag for the parts dir and the outputs; default ft<NEURONS>_<date>.
+#   OUT=             output folder; default analysis/<NAME>.
+#   SKIP_EXAMPLES=1  skip step 4.
+#
+# SIZING -- read this before raising NEURONS.
+# Measured on a cluster node, 1852-segment morphology: 0.995 s per simulation with the short
+# window, 3.107 s with the 800 ms window (3.1x; a naive fixed-dt long window would be ~57x).
+# So the single-core cost is
+#       NEURONS x n_layers x 3.1 s        (plus one cell build per morphology x layer)
+# The default 1000 x 3 layers = 3000 simulations = ~2.6 CPU-hours, a few minutes across 48
+# cores once contention is allowed for. Check your own number: smoke_test_ih_bump.py prints
+# the ratio and dryrun.pbs prints the solo s/sim.
+#
+# THE CULTURES ARE NOT BIOLOGICAL SIZE. config.n_neurons_hpc() is 1700 somata per well; this
+# job splits NEURONS across CULTURES, so at the defaults a "culture" is 100 neurons. That is
+# right for a scaling run you want to look at, and WRONG for the final campaign, where a
+# culture must be a whole well so that culture-level error bars mean what they say. For that,
+# leave NEURONS unset-by-count and use jobs/submit_seeded.sh with the biological count.
+# ---------------------------------------------------------------------------
+#PBS -N estim_full_tuned
+#PBS -l nodes=1:ppn=48
+#PBS -l walltime=24:00:00
+#PBS -q cpu
+#PBS -j oe
+#PBS -o logs/estim_full_tuned.log
+
+set -euo pipefail
+
+REPO=""
+for cand in "${PBS_O_WORKDIR:-}" "${PBS_O_WORKDIR:-}/.." "$PWD" "$PWD/.." \
+            "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)"; do
+    if [ -n "$cand" ] && [ -f "$cand/culture_export.py" ]; then REPO="$(cd "$cand" && pwd)"; break; fi
+done
+[ -n "$REPO" ] || { echo "FATAL: repo not found" >&2; exit 1; }
+cd "$REPO"; mkdir -p logs
+[ -f jobs/env_setup.sh ] && source jobs/env_setup.sh || echo "NOTE: no jobs/env_setup.sh"
+
+NEURONS="${NEURONS:-1000}"
+CULTURES="${CULTURES:-10}"
+SEED="${SEED:-2000}"
+BUMP_MS="${BUMP_MS:-800}"
+BUMP_FRACTION="${BUMP_FRACTION:-1.0}"
+DV_THRESHOLDS="${DV_THRESHOLDS:-0.5:1:2}"
+NAME="${NAME:-ft${NEURONS}_$(date +%Y%m%d_%H%M)}"
+OUT="${OUT:-analysis/$NAME}"
+CONC="${PBS_NUM_PPN:-${PBS_NP:-$(nproc)}}"
+PER_CULTURE=$(( (NEURONS + CULTURES - 1) / CULTURES ))
+
+# --- refuse early rather than half way through ----------------------------
+python - "$BUMP_MS" "$BUMP_FRACTION" <<'PY' || exit 2
+import inspect, sys
+import rich_cell, rich_footprint
+miss = []
+if "axon_active" not in inspect.signature(rich_cell.build_rich_cell).parameters:
+    miss.append("rich_cell.build_rich_cell(axon_active=...)")
+if not hasattr(rich_cell, "tune_leak_isopotential"):
+    miss.append("rich_cell.tune_leak_isopotential")
+par = inspect.signature(rich_footprint.spikes_at).parameters
+miss += ["rich_footprint.spikes_at(%s=...)" % a for a in
+         ("bump_ms", "bump_dt_ms", "cvode_atol", "play_margin_ms") if a not in par]
+if miss:
+    print("FATAL: the full_tuned delivery is incomplete. Missing:", file=sys.stderr)
+    for m in miss:
+        print("   -", m, file=sys.stderr)
+    sys.exit(2)
+from config import CFG
+if CFG.cell_model != "full_tuned":
+    print("FATAL: config.cell_model is %r, not 'full_tuned'. Set it in config.py -- the model "
+          "is recorded in every row and decides which results_<model>/ tree is written."
+          % CFG.cell_model, file=sys.stderr)
+    sys.exit(2)
+print("prerequisites OK | cell_model=full_tuned | bump_ms=%s | bump_culture_fraction=%s"
+      % (sys.argv[1], sys.argv[2]))
+PY
+
+echo "================================================================"
+echo "name       : $NAME"
+echo "neurons    : $NEURONS per layer, in $CULTURES cultures of $PER_CULTURE"
+echo "layers     : ${LAYERS:-config.layers_um}"
+echo "seed       : $SEED   cores: $CONC   bump window: $BUMP_MS ms"
+echo "output     : $OUT"
+echo "================================================================"
+mkdir -p "$OUT"
+
+# --- 1. simulate + merge this job's parts ---------------------------------
+export JOB_NAME="$NAME" JOB_SEED="$SEED" EXPECT_MODEL="full_tuned"
+export NEURONS_PER_CULTURE="$PER_CULTURE"
+export ESTIM_BUMP_MS="$BUMP_MS" ESTIM_BUMP_FRACTION="$BUMP_FRACTION"
+[ -n "${LAYERS:-}" ] && export ESTIM_LAYERS="$LAYERS"
+time bash jobs/run_parallel.sh "$CONC" "$CULTURES"
+
+MODEL=full_tuned
+JOBDIR="results_${MODEL}/${NAME}"
+ACT="$JOBDIR/culture_Pactivation.csv"
+[ -f "$ACT" ] || { echo "FATAL: $ACT not written -- see the log above" >&2; exit 3; }
+wc -l "$JOBDIR"/culture_P*.csv
+
+# --- 2. outcome statistics and maps ---------------------------------------
+echo "--- outcome statistics -------------------------------------------"
+python culture_statistics.py --input "$JOBDIR" --output "$OUT/stats" --outcome all \
+    --distance-bin 5 --angle-bin 5 --orientation-bin 5 --xy-bin 10 \
+    --dv-threshold "${DV_THRESHOLDS%%:*}" 2>&1 | tail -20
+
+# --- 3. the post-pulse kinetics -------------------------------------------
+if [ "$BUMP_MS" != "0" ]; then
+    echo "--- bump statistics ----------------------------------------------"
+    python plot_bump_statistics.py --input "$ACT" --bin-um 40 \
+        --out-pdf "$OUT/bump_statistics.pdf" --out-csv "$OUT/bump_statistics.csv"
+fi
+
+# --- 4. a few example traces ----------------------------------------------
+if [ "${SKIP_EXAMPLES:-0}" != "1" ] && [ "$BUMP_MS" != "0" ]; then
+    echo "--- example Vm traces --------------------------------------------"
+    python plot_vm_examples.py --cell-model full_tuned --bump-ms "$BUMP_MS" \
+        --out-pdf "$OUT/plot_vm_examples.pdf" --out-csv "$OUT/plot_vm_examples.csv"
+fi
+
+echo "================================================================"
+find "$OUT" -maxdepth 2 -name '*.pdf' -o -maxdepth 2 -name '*.csv' | sort
+echo "raw rows (with the kinetics columns): $ACT"
+echo "done: $OUT"
