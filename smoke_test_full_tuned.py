@@ -22,6 +22,47 @@ import sys
 import numpy as np
 
 import bump_kinetics as bk
+
+# --- PREREQUISITE GATE -----------------------------------------------------
+# full_tuned needs BOTH halves of the delivery: the passive-axon switch and the leak tuning in
+# rich_cell.py, and the long-window arguments in rich_footprint.spikes_at. If one half is
+# missing, importing culture_export still succeeds and the failure surfaces minutes later as a
+# TypeError inside a NEURON call -- which is what happened on the cluster when rich_cell.py and
+# rich_footprint.py had not been pushed. Fail here instead, naming the file.
+def _prerequisites():
+    import inspect
+    missing = []
+    try:
+        import rich_cell
+        if "axon_active" not in inspect.signature(rich_cell.build_rich_cell).parameters:
+            missing.append("rich_cell.build_rich_cell(axon_active=...)  [step 1]")
+        if not hasattr(rich_cell, "tune_leak_isopotential"):
+            missing.append("rich_cell.tune_leak_isopotential            [step 1]")
+    except Exception as exc:
+        missing.append("rich_cell: %s" % exc)
+    try:
+        import rich_footprint
+        par = inspect.signature(rich_footprint.spikes_at).parameters
+        for a in ("bump_ms", "bump_dt_ms", "cvode_atol", "play_margin_ms"):
+            if a not in par:
+                missing.append("rich_footprint.spikes_at(%s=...)%s [step 2]"
+                               % (a, " " * max(0, 14 - len(a))))
+    except Exception as exc:
+        missing.append("rich_footprint: %s" % exc)
+    if missing:
+        print("PREREQUISITES MISSING -- this is a delivery problem, not a test failure:")
+        for m in missing:
+            print("   -", m)
+        print("\nThose two files are part of the full_tuned delivery and are NOT in this\n"
+              "checkout. Push rich_cell.py and rich_footprint.py from the laptop clone, then\n"
+              "pull here. Check with:\n"
+              "    python -c \"import inspect,rich_cell as r;"
+              "print(hasattr(r,'tune_leak_isopotential'))\"")
+        sys.exit(2)
+
+
+_prerequisites()
+
 import culture_export as ce
 from config import CFG
 

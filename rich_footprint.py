@@ -49,17 +49,47 @@ def _placed(cell, pos_xy, theta_deg):
 def spikes_at(cell, pos_xy, theta_deg, i0_uA=50.0, phase_dur_ms=0.25,
               baseline_ms=5.0, post_ms=6.0, dt_ms=0.025,
               sigma_Sm=1.5, rmin_um=12.5, ramp_us=100.0, interphase_us=0.0, phase="both",
-              detail=False, pre_end_ms=0.0, v_init_mV=V_REST):
+              detail=False, pre_end_ms=0.0, v_init_mV=V_REST,
+              bump_ms=0.0, bump_dt_ms=0.5, cvode_atol=1e-6, play_margin_ms=1.0):
     """Light: soma-only recording, short window. Returns (n_spikes, Vsoma_max).
     detail=True -> (n_spikes, Vsoma_max, tw, vw): the soma trace from `pre_end_ms` before the
     END of phase 2 onward, with tw = t - t_end (tw = 0 exactly at the end of phase 2).
-    v_init_mV: initial voltage of every compartment (finitialize)."""
+    v_init_mV: initial voltage of every compartment (finitialize).
+
+    bump_ms = 0 (default): the short window above, unchanged and bit-identical to before.
+
+    bump_ms > 0: keep integrating for bump_ms AFTER the end of phase 2, to capture the slow Ih
+    bump (it peaks near 100 ms and decays over hundreds of ms, so the 11.5 ms default window
+    never contained it). Two things make that affordable -- a naive long window at fixed dt costs
+    ~60x the short one, which is not usable at campaign scale:
+
+      * the field is PLAYED ONLY OVER THE PULSE. The stimulus is zero after t_on + 2*phase, but
+        a Vector.play of the full window length is built for every segment (~1250 of them), so a
+        long window multiplies setup and memory for nothing. Here the play vectors cover the
+        pulse plus play_margin_ms and are then removed, with e_extracellular set to 0. Verified
+        bit-identical to the full-length play (0.00e+00 mV at t = 6, 20, 50, 100 ms).
+      * the post-pulse decay is integrated by CVODE, which takes very large steps through a
+        smooth event-free trace. Measured: an 800 ms window costs ~2.6x the short one, against
+        ~60x at fixed dt. The pulse itself is still integrated at fixed dt_ms, so the stimulus
+        and the spike count are resolved exactly as before.
+
+    The bump trace is recorded on a FIXED bump_dt_ms grid, not at solver steps, so the
+    time-to-peak is not quantised by wherever CVODE happens to step on a broad flat maximum.
+    cvode_atol: 1e-6 keeps the fitted taus within ~0.05 ms of a fixed-dt reference (1e-4 costs
+    ~15% less but drifts the decay tau by ~0.2 ms).
+
+    Returns (n_spikes, Vmax, tw, vw, tb, vb) when detail and bump_ms > 0, with tb rebased so
+    t = 0 is the END of phase 2, like tw."""
     coords, refs = _placed(cell, pos_xy, theta_deg)
     elec, sign = F.default_array(monopolar=False)
     g = F.geom_factor(coords, elec, sign, sigma_Sm=sigma_Sm, rmin_um=rmin_um)
     t_on = baseline_ms
     post = post_ms      # detail=True must NOT lengthen the run (HPC cost)
-    t = np.arange(0.0, baseline_ms + 2 * phase_dur_ms + post + dt_ms, dt_ms)
+    bump_ms = float(bump_ms or 0.0)
+    t_end = t_on + 2 * phase_dur_ms                # END of the biphasic pulse (after phase 2)
+    t_stop = t_end + (bump_ms if bump_ms > 0 else post)
+    # play grid: the whole window in the classic mode, the pulse only in bump mode
+    t = np.arange(0.0, (t_end + play_margin_ms if bump_ms > 0 else t_stop) + dt_ms, dt_ms)
     I = F.biphasic_current(t - t_on, i0_uA, phase_dur_ms, True, ramp_us, interphase_us)  # ramped
     if phase != "both":                                    # deliver only phase 1 (+) or phase 2 (-)
         I = I * F.phase_mask(t, t_on, phase_dur_ms, phase, interphase_us)
@@ -70,16 +100,37 @@ def spikes_at(cell, pos_xy, theta_deg, i0_uA=50.0, phase_dur_ms=0.25,
     for k, seg in enumerate(refs):
         vv = h.Vector(g[k] * I); vv.play(seg._ref_e_extracellular, tvec, True); keep.append(vv)
     vs = h.Vector().record(cell.soma[0](0.5)._ref_v)
-    h.celsius = 37; h.dt = dt_ms; h.tstop = t[-1]
-    h.finitialize(float(v_init_mV)); h.continuerun(t[-1])
+    ts = h.Vector().record(h._ref_t) if (bump_ms > 0 and detail) else None
+    if bump_ms > 0:                                # fixed output grid for the bump fit
+        vb = h.Vector(); vb.record(cell.soma[0](0.5)._ref_v, bump_dt_ms)
+        tb = h.Vector(); tb.record(h._ref_t, bump_dt_ms)
+    h.celsius = 37; h.dt = dt_ms; h.tstop = t_stop
+    try:
+        h.finitialize(float(v_init_mV))
+        h.continuerun(t[-1])                       # through the pulse, fixed dt
+        if bump_ms > 0:
+            for vv in keep[1:]:                    # stimulus is over: drop the play, zero the field
+                vv.play_remove()
+            for seg in refs:
+                seg.e_extracellular = 0.0
+            h.cvode_active(1); h.cvode.atol(float(cvode_atol))
+            h.continuerun(t_stop)
+    finally:
+        h.cvode_active(0)                          # never leak the solver mode to the next call
     v = np.asarray(vs)
     nsp = int(np.sum((v[:-1] < 0) & (v[1:] >= 0)))
     if detail:
-        t_end = t_on + 2 * phase_dur_ms            # END of the biphasic pulse (after phase 2)
+        t_rec = np.asarray(ts) if bump_ms > 0 else t
         t_start = t_end - max(0.0, float(pre_end_ms))
-        m = t >= t_start
-        tw = (t[m] - t_end).astype(float)          # t=0 is exactly END of phase 2
+        m = t_rec >= t_start
+        tw = (t_rec[m] - t_end).astype(float)      # t=0 is exactly END of phase 2
         vw = v[m].astype(float)
+        if bump_ms > 0:
+            # .copy(): np.asarray() on a live NEURON Vector is a VIEW into its buffer, and the
+            # next spikes_at() call overwrites it -- silently zeroing an already returned bump
+            # trace (caught by smoke_test_ih_bump).
+            return (nsp, float(v.max()), tw, vw,
+                    np.asarray(tb).copy() - t_end, np.asarray(vb).copy())
         return nsp, float(v.max()), tw, vw
     return nsp, float(v.max())
 

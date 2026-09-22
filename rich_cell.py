@@ -13,7 +13,8 @@ Domains (by section name): soma / apic (apical) / dend (basal) / axon (AIS).
   R2 apic  : NaTa_t(0.001) SKv3_1 SK_E2 Ca_LVAst Ca_HVA Im Ih CaDynamics_E2
              (NOT K_Pst/K_Tst); Ih exp gradient; Ca hot spot 360-600 um
   R3 dend  : Ih only, uniform = somatic value
-  R4 axon  : Eyal na(200)/kv(100) on the AIS  (Rich = passive; kept per request)
+  R4 axon  : axon_active=True  -> Eyal na(200)/kv(100) on the AIS (the 2026-09 campaigns)
+             axon_active=False -> PASSIVE, i.e. Rich's own model (cell_model "full_tuned")
 
 Modes of build_rich_cell(asc, passive_only=False, soma_only=False):
   default      : R0-R4 above (the full-active model of the preliminary campaign).
@@ -80,7 +81,7 @@ def _gbar(seg, suffix, value):
     setattr(seg, f"g{suffix}bar_{suffix}", value)
 
 
-def build_rich_cell(asc_path, passive_only=False, soma_only=False):
+def build_rich_cell(asc_path, passive_only=False, soma_only=False, axon_active=True):
     _load()
     if passive_only and soma_only:
         raise ValueError("Choose either passive_only=True or soma_only=True, not both")
@@ -172,7 +173,9 @@ def build_rich_cell(asc_path, passive_only=False, soma_only=False):
             for seg in sec:
                 _gbar(seg, "Ih", GBAR["Ih"])
 
-        elif "axon" in name:                              # AIS: keep Eyal na/kv
+        elif "axon" in name:                              # AIS
+            if not axon_active:
+                continue                              # Rich's own model: the axon stays PASSIVE
             sec.insert("na"); sec.insert("kv")
             sec.ena = ENA; sec.ek = -90.0
             for seg in sec:
@@ -204,6 +207,113 @@ def build_rich_cell(asc_path, passive_only=False, soma_only=False):
                             seg.gbar_kv *= _vm
 
     return cell
+
+
+# Mechanisms this file knows how to account for when summing a segment's membrane current.
+# pas is the leak (the knob); Ih is the only NONSPECIFIC_CURRENT (ihcn); every other channel
+# writes ina / ik / ica. CaDynamics_E2 only writes cai and carries no current of its own.
+# extracellular/capacitance/morphology are not channels. A mechanism outside this set would be
+# silently skipped by _segment_ionic_current(), which would break the zero-current condition --
+# so tune_leak_isopotential() refuses to run instead.
+KNOWN_MECHS = {"pas", "Ih", "Im", "K_Pst", "K_Tst", "NaTa_t", "Nap_Et2", "SK_E2", "SKv3_1",
+               "Ca_HVA", "Ca_LVAst", "CaDynamics_E2", "na", "kv",
+               "extracellular", "capacitance", "morphology"}
+
+
+def all_sections(cell):
+    """Every section of the cell, the stylized axon included, de-duplicated by name."""
+    return list({s.name(): s for s in list(cell.all) + list(getattr(cell, "axon", []))}.values())
+
+
+def _segment_ionic_current(seg, has_ih):
+    """Sum of every NON-LEAK membrane current of one segment (mA/cm2), at the present v."""
+    i = 0.0
+    for attr in ("ina", "ik", "ica"):
+        i += getattr(seg, attr, 0.0)
+    if has_ih:
+        i += seg.ihcn_Ih
+    return i
+
+
+def domain_of(section_name):
+    for d in ("soma", "apic", "dend", "axon"):
+        if d in section_name:
+            return d
+    return "other"
+
+
+def tune_leak_isopotential(cell, v_target_mV, celsius=37.0):
+    """Make v_target_mV the zero-net-current potential of EVERY segment, via the leak alone.
+
+    The arbour of the untuned model is not isopotential: the apical Ih gradient pulls the distal
+    tuft up and the leak pulls the stylized axon down (measured spread 14.1 mV with Rich's passive
+    axon). This imposes one potential on the whole cell, so that with no stimulus every segment
+    sits at v_target_mV and no axial current flows.
+
+    For each segment, with i_other = the sum of all non-leak currents at v_target_mV:
+
+        i_pas + i_other = 0  ->  g_pas * (v_target - e_pas) = -i_other
+                             ->  e_pas = v_target + i_other / g_pas
+
+    Only e_pas moves; g_pas is untouched, so Rm, tau_m and the electrotonic length -- and hence
+    the coupling to the extracellular field and every calibration that depends on it -- are
+    exactly as before. Solving through g_pas instead is not possible: wherever i_other is OUTWARD
+    the leak would have to be inward at v_target, which a leak with e_pas below v_target cannot
+    do, so g_pas would have to be negative (measured: all 600 axon segments of the full-active
+    model). e_pas becomes a fitted per-compartment parameter rather than a measured reversal, and
+    in the distal apical it can fall well below any ionic reversal -- the report returned here
+    records the range so it can be stated in the methods.
+
+    Temperature-independent at steady state: the gating variables settle at mInf(v), and the q10
+    factors scale only the taus (verified: identical e_pas at celsius 6.3 and 37). celsius is set
+    anyway so that anything with a temperature-dependent steady state cannot surprise us.
+
+    Call AFTER all channels are inserted and after the config gbar multipliers are applied.
+    Returns a report dict; raises RuntimeError on an unknown mechanism.
+    """
+    import numpy as _np
+    secs = all_sections(cell)
+
+    unknown = set()
+    for sec in secs:
+        unknown |= set(sec.psection().get("density_mechs", {})) - KNOWN_MECHS
+    if unknown:
+        raise RuntimeError(
+            "tune_leak_isopotential: unknown mechanism(s) %s. If one carries a "
+            "NONSPECIFIC_CURRENT it is not in the current sum and the tuning would be silently "
+            "wrong; add it to KNOWN_MECHS and to _segment_ionic_current()." % sorted(unknown))
+
+    v_target = float(v_target_mV)
+    h.celsius = float(celsius)
+    h.finitialize(v_target)      # every compartment at v_target, every gating state steady there
+    h.fcurrent()
+
+    rows = []
+    for sec in secs:
+        has_ih = h.ismembrane("Ih", sec=sec)
+        d = domain_of(sec.name())
+        for seg in sec:
+            io = _segment_ionic_current(seg, has_ih)
+            rows.append((d, seg, io, seg.g_pas, seg.i_pas + io))
+
+    before = _np.array([abs(r[4]) for r in rows])
+    e_new = {}
+    for d, seg, io, g, _net in rows:
+        e = v_target + io / g
+        seg.e_pas = e
+        e_new.setdefault(d, []).append(e)
+
+    h.finitialize(v_target); h.fcurrent()
+    after = _np.array([abs(seg.i_pas + _segment_ionic_current(seg, h.ismembrane("Ih", sec=sec)))
+                       for sec in secs for seg in sec])
+
+    rep = {"v_target_mV": v_target, "n_segments": len(rows),
+           "max_abs_net_before": float(before.max()), "max_abs_net_after": float(after.max()),
+           "e_pas_min": float(min(min(v) for v in e_new.values())),
+           "e_pas_max": float(max(max(v) for v in e_new.values())),
+           "per_domain": {d: (float(_np.min(v)), float(_np.median(v)), float(_np.max(v)), len(v))
+                          for d, v in e_new.items()}}
+    return rep
 
 
 def settled_resting_voltage(cell, tstop_ms=1500.0, dt_ms=0.025, v_init_mV=-85.0):
