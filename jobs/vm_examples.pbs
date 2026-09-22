@@ -1,0 +1,125 @@
+#!/bin/bash
+# ---------------------------------------------------------------------------
+# PBS/Torque -- EXAMPLE Vm TRACES: one PDF page per cell instance.
+#
+# Soma Vm timecourse with the stimulus window shaded and the first post-pulse peak and the
+# Ih bump each marked, plus the two fits underneath -- the single exponential for the direct
+# polarisation and the double exponential for the bump, pinned to zero at the end of the
+# pulse. See plot_vm_examples.py for the model and why the pinning matters.
+#
+# This runs NEW simulations (it does not read the campaign CSVs), but only a handful: one
+# cell build per (morphology, layer) plus one sham and one stimulation per placement. Single
+# process, so ppn=2 is enough -- the second core is only numpy headroom.
+#
+# Submit from the pipeline folder:   qsub jobs/vm_examples.pbs
+# Options, comma-separated:          qsub -v MODEL=soma_only,N=3 jobs/vm_examples.pbs
+#   MODEL=...        full_tuned (default) | full_active | soma_only
+#                    soma_only is the NEGATIVE control: Ih is dendritic, so it has no bump
+#   N=...            how many of the built-in default placements (default 6)
+#   PLACEMENTS=...   explicit list, morph:layer:x:y:theta, comma-separated (overrides N)
+#   BUMP_MS=...      window integrated after the pulse (default 800)
+#   FIT=...          staged (default) | joint
+#   EARLY_FLOOR=...  where the single-exponential fit stops, as a fraction of the peak (0.25)
+#   I0=...           stimulus amplitude in uA (default: config.i0_uA)
+#   OUT=...          output folder (default: analysis/vm_examples_<model>_<date>_<time>)
+#   SMOKE=0          skip the offline smoke test that runs before the figure
+#
+# Cost: measured ~2 min per (morphology, layer) build plus ~20 s per placement at 800 ms,
+# so the 6 default placements over 5 distinct cells took ~13 min. walltime 02:00:00 is
+# generous on purpose; raise it if you pass many PLACEMENTS.
+# ---------------------------------------------------------------------------
+#PBS -N estim_vm_examples
+#PBS -l nodes=1:ppn=2
+#PBS -l walltime=02:00:00
+#PBS -q cpu
+#PBS -j oe
+#PBS -o logs/estim_vm_examples.log
+
+set -euo pipefail
+
+REPO=""
+for cand in "${PBS_O_WORKDIR:-}" "${PBS_O_WORKDIR:-}/.." "$PWD" "$PWD/.." "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)"; do
+    if [ -n "$cand" ] && [ -f "$cand/plot_vm_examples.py" ]; then
+        REPO="$(cd "$cand" && pwd)"; break
+    fi
+done
+if [ -z "$REPO" ]; then echo "FATAL: repo not found (no plot_vm_examples.py)" >&2; exit 1; fi
+cd "$REPO"
+mkdir -p logs
+
+if [ -f jobs/env_setup.sh ]; then
+    source jobs/env_setup.sh
+else
+    echo "NOTE: jobs/env_setup.sh absent -- relying on the ambient environment"
+fi
+
+MODEL="${MODEL:-full_tuned}"
+BUMP_MS="${BUMP_MS:-800}"
+FIT="${FIT:-staged}"
+EARLY_FLOOR="${EARLY_FLOOR:-0.25}"
+N="${N:-6}"
+OUT="${OUT:-analysis/vm_examples_${MODEL}_$(date +%Y%m%d_%H%M)}"
+mkdir -p "$OUT"
+
+# --- the delivery this script depends on must actually be in place ---------
+# plot_vm_examples.py needs BOTH halves of steps 1-2: the passive-axon switch and the leak
+# tuning in rich_cell.py, and the long-window arguments in rich_footprint.spikes_at. Missing
+# either one fails deep inside a simulation minutes later, so check it up front.
+python - <<'PY'
+import inspect, sys
+missing = []
+try:
+    import rich_cell
+    if not hasattr(rich_cell, "tune_leak_isopotential"):
+        missing.append("rich_cell.tune_leak_isopotential (step 1)")
+    if "axon_active" not in inspect.signature(rich_cell.build_rich_cell).parameters:
+        missing.append("rich_cell.build_rich_cell(axon_active=...) (step 1)")
+except Exception as exc:
+    missing.append("rich_cell: %s" % exc)
+try:
+    import rich_footprint
+    p = inspect.signature(rich_footprint.spikes_at).parameters
+    for a in ("bump_ms", "bump_dt_ms", "cvode_atol", "play_margin_ms"):
+        if a not in p:
+            missing.append("rich_footprint.spikes_at(%s=...) (step 2)" % a)
+except Exception as exc:
+    missing.append("rich_footprint: %s" % exc)
+try:
+    import bump_kinetics
+    for a in ("fit_exp_decay", "fit_double_exp_from_zero", "fit_post_pulse",
+              "eval_bump_component", "eval_offset_component"):
+        if not hasattr(bump_kinetics, a):
+            missing.append("bump_kinetics.%s -- OLD copy, overlay the new tarball" % a)
+except Exception as exc:
+    missing.append("bump_kinetics: %s" % exc)
+if missing:
+    print("FATAL: this job needs the full_tuned delivery. Missing:", file=sys.stderr)
+    for m in missing:
+        print("  -", m, file=sys.stderr)
+    print("Overlay estim_full_tuned_steps1-2.tar.gz AND estim_vm_example_plots.tar.gz.",
+          file=sys.stderr)
+    sys.exit(2)
+print("prerequisites OK: steps 1-2 and the new bump_kinetics are in place")
+PY
+
+if [ "${SMOKE:-1}" != "0" ]; then
+    echo "--- offline smoke test (no NEURON, instant) ---"
+    python smoke_test_bump_kinetics.py | tail -1
+fi
+
+echo "model      : $MODEL"
+echo "bump window: $BUMP_MS ms   fit: $FIT   early floor: $EARLY_FLOOR"
+echo "output     : $OUT"
+echo "---------------------------------------------------------------"
+
+ARGS=(--cell-model "$MODEL" --bump-ms "$BUMP_MS" --fit "$FIT"
+      --early-floor "$EARLY_FLOOR"
+      --out-pdf "$OUT/plot_vm_examples.pdf" --out-csv "$OUT/plot_vm_examples.csv")
+if [ -n "${PLACEMENTS:-}" ]; then ARGS+=(--placements "$PLACEMENTS"); else ARGS+=(--n-instances "$N"); fi
+if [ -n "${I0:-}" ]; then ARGS+=(--i0-uA "$I0"); fi
+
+time python plot_vm_examples.py "${ARGS[@]}"
+
+echo "---------------------------------------------------------------"
+ls -la "$OUT"
+echo "done: $OUT/plot_vm_examples.pdf"
