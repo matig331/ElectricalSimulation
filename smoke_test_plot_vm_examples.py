@@ -17,7 +17,9 @@ first, it is instant.
   [6] the pinned fit WITHOUT the residual term collapses -- the failure mode the residual
       term exists to prevent
   [7] staged and joint fit modes agree on the bump
-  [8] the driver writes a PDF with one page per placement and a CSV with a matching header
+  [8] the reconstruction really does reproduce the measured trace -- the claim the top panel
+      makes by drawing the model over the data
+  [9] the driver writes a PDF with one page per placement and a CSV with a matching header
 """
 import os
 import re
@@ -149,7 +151,36 @@ for r, f, (x, y, th) in zip(recs, fits, PLACES):
              c["tau_decay_ms"], 100 * dd, a["peak_mV"], c["peak_mV"], 100 * dp),
           dr < 0.15 and dd < 0.15 and dp < 0.10, (dr, dd, dp))
 
-print("\n[8] the driver writes a PDF and a CSV")
+print("\n[8] the reconstruction reproduces the measured trace")
+for r, f, (x, y, th) in zip(recs, fits, PLACES):
+    tm, vm_model, res = P.reconstruction(r, f)
+    fin = np.isfinite(res)
+    check("(%+.0f,%+.0f): the model is defined from t0 onward (%d of %d samples)"
+          % (x, y, int(fin.sum()), res.size),
+          int(fin.sum()) > 0.9 * int(np.sum(tm >= 0.0)))
+    rms = float(np.sqrt(np.mean(res[fin] ** 2)))
+    amp = abs(f["bump"]["peak_mV"])
+    check("   residual RMS %.5f mV = %.1f%% of the bump amplitude %.3f mV"
+          % (rms, 100.0 * rms / amp, amp), rms < 0.05 * amp, (rms, amp))
+    # the residual must be small where it matters -- the sub-ms grid edge at t=0 is not the
+    # claim being checked, the bump is
+    late = fin & (tm >= 5.0)
+    mx = float(np.max(np.abs(res[late])))
+    check("   away from the t=0 grid edge, max |residual| %.5f mV = %.1f%% of the bump"
+          % (mx, 100.0 * mx / amp), mx < 0.10 * amp, mx)
+    # and it must not be STRUCTURED: a model missing a component leaves a slow arc, which
+    # shows up as the late-window mean being far from zero relative to its own scatter
+    tail = fin & (tm >= 200.0)
+    if int(tail.sum()) > 20:
+        mu, sd = float(np.mean(res[tail])), float(np.std(res[tail]))
+        check("   late residual is centred (mean %.2e vs sd %.2e mV)" % (mu, sd),
+              abs(mu) < max(3.0 * sd, 0.01 * amp), (mu, sd))
+    vm_meas = r["v_grid"]
+    check("   the residual really is measured minus model (%.2e mV)"
+          % float(np.nanmax(np.abs((vm_meas - vm_model)[fin] - res[fin]))),
+          float(np.nanmax(np.abs((vm_meas - vm_model)[fin] - res[fin]))) < 1e-12)
+
+print("\n[9] the driver writes a PDF and a CSV")
 places = [(MORPH, LAYER, x, y, th) for (x, y, th) in PLACES]
 pdf, csvp = P.main(cell_model="full_tuned", placements=places, bump_ms=BUMP_MS,
                    out_pdf="_smoke_pve.pdf", out_csv="_smoke_pve.csv", verbose=False)

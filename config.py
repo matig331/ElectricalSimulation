@@ -18,9 +18,60 @@ class WellConfig:
     #   "soma_only"   : soma = full Rich active set; dendrites + stylized axon/AIS PASSIVE;
     #                   v_init = settled rest of each morphology x layer (the FINAL dataset).
     #   "full_active" : Rich + active Eyal AIS, v_init = v_rest_mV (the preliminary dataset).
-    # Results go to results_<cell_model>/ -- the two models are never written, merged or
-    # analysed together (culture_merge.py and culture_statistics.py refuse to pool them).
+    # Results go to results_<cell_model>/ -- models are never written, merged or analysed
+    # together (culture_merge.py and culture_statistics.py refuse to pool them).
+    #   "soma_only"   active soma, passive dendrites. Ih is DENDRITIC, so this model has no
+    #                 post-pulse bump at all (measured: 0.007 mV) -- it cannot carry the
+    #                 kinetics statistic.
+    #   "full_active" the full Rich channel set everywhere, legacy scalar v_init.
+    #   "full_tuned"  the full set with Rich's own PASSIVE axon, and the leak tuned so the
+    #                 cell's measured settled rest is imposed isopotentially across the whole
+    #                 arbour (rich_cell.tune_leak_isopotential). This is the model the bump
+    #                 kinetics are measured on.
     cell_model: str = "soma_only"
+
+    # --- full_tuned: leak tuning -------------------------------------------
+    # e_pas is set per segment to e_pas = V_target + i_other/g_pas, with V_target the cell's
+    # own free-settled somatic rest and i_other = ina + ik + ica + ihcn_Ih at that voltage.
+    # g_pas, Ra and cm are untouched, so Rm, tau_m, lambda and the field coupling are exactly
+    # as before; e_pas becomes a fitted compartmental parameter (it reaches -160 mV in the
+    # distal apical -- say so in the methods). Ignored unless cell_model == "full_tuned".
+    leak_tuning: bool = True
+    leak_tune_celsius: float = 37.0     # MUST equal the simulation temperature: eca is
+                                        # Nernst-computed, so the tuning is temperature-dependent
+
+    # --- post-pulse Ih bump: the long window and its fit --------------------
+    # The bump peaks near 95 ms and decays over hundreds, so the 11.5 ms window the outcome
+    # classification uses never contained it. bump_ms > 0 keeps integrating after the pulse
+    # (field played over the pulse only, then CVODE) -- measured cost 2.6-2.9x per simulation,
+    # against ~62x for a naive fixed-dt long window. bump_ms = 0 disables the kinetics
+    # entirely and reproduces the short-window campaign exactly.
+    bump_ms: float = 800.0
+    bump_dt_ms: float = 0.5             # FIXED output grid for the bump fit (not solver steps,
+                                        # which would quantise the time-to-peak)
+    cvode_atol: float = 1e-6            # 1e-6 keeps the fitted taus within ~0.05 ms of a
+                                        # fixed-dt reference; 1e-4 is 15% faster but drifts
+                                        # tau_decay by ~0.2 ms
+    play_margin_ms: float = 3.0         # fixed-dt tail after the pulse. It sets how much of
+                                        # the trace the stimulated and sham runs share sample
+                                        # for sample, hence the window on which DeltaV exists
+                                        # at 0.025 ms -- which the ~0.2-0.6 ms direct
+                                        # relaxation needs. Costs ~120 extra fixed steps.
+    bump_t0_ms: float = 0.0             # the instant whose DeltaV is DEFINED to be the zero of
+                                        # the bump. 0 = the end of phase 2, which is also where
+                                        # the physical bump starts -- the only value for which
+                                        # the fitted model is exactly specified.
+    bump_early_floor: float = 0.25      # where the single-exponential fit of the direct
+                                        # relaxation stops, as a fraction of its peak. The
+                                        # relaxation is multi-exponential, so the fitted tau
+                                        # moves with this; early_t_1e_ms in the CSV is the
+                                        # window-free number to compare across neurons.
+    # Fraction of CULTURES that get the long window, drawn per culture from (seed, culture) so
+    # the choice is reproducible and independent of which cultures ran. 1.0 = every neuron.
+    # Below 1.0 the outcome statistics stay at full coverage and only the kinetics are
+    # subsampled -- the kinetics are a distribution, so a subsample is usually enough, and it
+    # is unbiased in distance and orientation (unlike restricting the window by position).
+    bump_culture_fraction: float = 1.0
 
     # --- electrodes (3Brain HyperCAM / CorePlate) --------------------------
     pitch_um: float = 60.0

@@ -188,6 +188,12 @@ DEXP_N_REFINE = 4                   # zoom passes after the first grid
 DEXP_ZOOM = 0.25                    # log-width of the search box, x this per pass
 DEXP_EDGE_TOL_DEC = 0.02            # a tau this close (in decades) to a bound counts as pinned
 DEXP_MAX_TAU_WINDOW_MULT = 5.0      # reject tau_decay_ms beyond this x the fitted window length
+# The measured bump peak is read over [t0 + lag, t_end], with lag = 5 * tau_offset but never
+# below this floor. The floor matters: tau_offset comes from a fit that can itself be poor on
+# a trace with no bump, and a lag of a fraction of a millisecond would then read the tail of
+# the direct relaxation and report it as a bump. 5 ms is 10-25x the measured relaxation
+# (0.2-0.6 ms) and far before the bump peak (~95 ms), so it separates the two on every trace.
+DEXP_DATA_LAG_FLOOR_MS = 5.0
 
 
 def fit_exp_decay(t_ms, dv_mV, t0_ms=0.0, t_peak_search_ms=5.0, t_max_ms=40.0,
@@ -394,6 +400,7 @@ def fit_double_exp_from_zero(t_ms, dv_mV, t0_ms=0.0, t_end_ms=None, free_offset=
                              bounds_rise_ms=DEXP_TAU_RISE_BOUNDS_MS,
                              bounds_decay_ms=DEXP_TAU_DECAY_BOUNDS_MS,
                              n_grid=DEXP_N_GRID, n_refine=DEXP_N_REFINE, zoom=DEXP_ZOOM,
+                             data_lag_floor_ms=DEXP_DATA_LAG_FLOOR_MS,
                              min_amp_mV=0.05, min_r2=0.90):
     """Double exponential for the slow Ih bump, PINNED TO ZERO at t0_ms.
 
@@ -461,10 +468,16 @@ def fit_double_exp_from_zero(t_ms, dv_mV, t0_ms=0.0, t_end_ms=None, free_offset=
         peak_dv_mV             the same point read off the DeltaV axis (= dv_t0_mV + the whole
                                model there), i.e. where the marker sits on a DeltaV plot
         data_peak_mV,
-        data_t_peak_ms         the MEASURED extremum of DeltaV over [t0 + 5*tau_offset, t_end]
-                               -- once the residual polarisation is gone DeltaV IS the bump,
-                               so this is the observed bump peak and compares directly with
-                               peak_mV
+        data_t_peak_ms         the MEASURED extremum of DeltaV over [t0 + lag, t_end], with
+                               lag = max(5*tau_offset, data_lag_floor_ms) -- once the residual
+                               polarisation is gone DeltaV IS the bump, so this is the
+                               observed bump peak and compares directly with peak_mV. It is
+                               the number to trust when fit_ok is 0: the fitted peak_mV of a
+                               REJECTED fit is the extremum of a model that does not describe
+                               the trace and can be anything (measured on a soma-only cell,
+                               which has no bump at all: peak_mV 0.228 mV against a measured
+                               data_peak_mV of 0.007 mV, with tau_decay pinned to its bound
+                               and fit_ok 0).
         sign                   'depol' / 'hyperpol' / 'none', from peak_mV
         r2, rmse_mV, n         quality and sample count
         t_fit_lo_ms,
@@ -520,7 +533,8 @@ def fit_double_exp_from_zero(t_ms, dv_mV, t0_ms=0.0, t_end_ms=None, free_offset=
     out["rmse_mV"] = float(np.sqrt(sse / u.size))
 
     # measured bump peak: once the residual polarisation is gone, DeltaV IS the bump
-    lag = 5.0 * (tau_off if tau_off is not None else tau_r)
+    lag = max(5.0 * (tau_off if tau_off is not None else tau_r),
+              float(data_lag_floor_ms))
     late = u >= min(lag, 0.5 * float(u[-1]))
     if late.any():
         k = int(np.argmax(np.abs(vw[late])))
@@ -937,3 +951,95 @@ def postpulse_row_values(fit):
             _rnd(fit["bump_peak_mV"], 6), _rnd(fit["bump_t_peak_ms"], 3),
             _rnd(fit["dv_t0_mV"], 6), fit["sign"], _rnd(fit["r2"], 5),
             _rnd(fit["rmse_mV"], 6), _rnd(fit["swap_dsse_frac"], 5), int(fit["fit_ok"])]
+
+
+# ===========================================================================
+# The STAGED fit, shared by the campaign and the example figure.
+#
+# The two post-pulse components are ~two orders of magnitude apart in time: the direct
+# relaxation is ~0.2-0.6 ms (the soma discharges by redistributing charge into the arbour, it
+# does not charge the whole cell), the Ih bump peaks near 95 ms. That forces two grids:
+#
+#   tau_m  is measured on the FINE DeltaV (solver resolution, 0.025 ms). On a 0.5 ms grid the
+#          decay has two samples and no fit exists.
+#   the bump is fitted on the uniform bump_dt_ms grid over the long window, with tau_m held
+#          FIXED from stage 1.
+#
+# One uniform least-squares over both cannot work: 1600 samples of bump against 4 of
+# polarisation leaves the polarisation unweighted. fit_post_pulse() is the joint alternative
+# for when the timescales are NOT separated; on these traces the two agree to 0.1-11 %.
+#
+# This function is the single implementation. culture_export.simulate_neuron() and
+# plot_vm_examples.analyse() both call it, so a campaign row and a figure page can never be
+# produced by two different fits.
+# ===========================================================================
+
+def common_prefix_len(t_a, t_b, atol=1e-9):
+    """Length of the leading run over which two solver time bases agree exactly.
+
+    Both the stimulated and the sham run integrate at FIXED dt up to t_end + play_margin_ms,
+    so their step times are identical there and DeltaV can be formed by plain subtraction --
+    no interpolation, no interpolation error, on precisely the stretch where the trace moves
+    fastest. After that CVODE adapts independently in the two runs and the bases diverge.
+    """
+    a = np.asarray(t_a, float)
+    b = np.asarray(t_b, float)
+    n = int(min(a.size, b.size))
+    if n == 0:
+        return 0
+    bad = np.nonzero(np.abs(a[:n] - b[:n]) > float(atol))[0]
+    return int(bad[0]) if bad.size else n
+
+
+def fit_staged(t_fine, dv_fine, t_grid, dv_grid, t0_ms=0.0, t_peak_search_ms=2.0,
+               early_floor=0.25, min_amp_mV=0.05, min_r2=0.90):
+    """Both post-pulse components of one trace, each on the grid that can resolve it.
+
+      stage 1  fit_exp_decay on (t_fine, dv_fine)   -> the direct polarisation, and tau_m
+      stage 2  fit_double_exp_from_zero on (t_grid, dv_grid), with tau_offset_ms = tau_m from
+               stage 1 -> the Ih bump, pinned to zero at t0_ms
+
+    `early_floor` is where stage 1 stops, as a fraction of the peak. It is a REAL choice: the
+    measured relaxation is multi-exponential, so tau_ms moves with it (0.22 ms at 0.10, 0.31
+    at 0.30, 0.47 at 0.50 on one placement) while r2 stays near 0.91 either way. The
+    comparable, window-free number is early["t_1e_ms"], and both are returned.
+
+    Passing dv_fine of length 0 (no fine trace available) still works: stage 1 is then run on
+    the coarse grid and will usually fail its gates, tau_offset_ms falls back to tau_rise, and
+    the bump fit is correspondingly less well specified. fit_ok reports it.
+
+    Returns dict(early=<fit_exp_decay result>, bump=<fit_double_exp_from_zero result>).
+    Never raises.
+    """
+    tf = np.asarray(t_fine, float)
+    vf = np.asarray(dv_fine, float)
+    tg = np.asarray(t_grid, float)
+    vg = np.asarray(dv_grid, float)
+    if tf.size < MIN_FIT_POINTS or tf.size != vf.size:
+        tf, vf = tg, vg                          # no fine trace: fall back to the coarse one
+    early = fit_exp_decay(tf, vf, t0_ms=t0_ms, t_peak_search_ms=t_peak_search_ms,
+                          t_max_ms=(float(tf[-1]) if tf.size else float(t0_ms)),
+                          floor_fraction=float(early_floor))
+    bump = fit_double_exp_from_zero(tg, vg, t0_ms=t0_ms, tau_offset_ms=early["tau_ms"],
+                                    min_amp_mV=min_amp_mV, min_r2=min_r2)
+    return dict(early=early, bump=bump)
+
+
+STAGED_COLUMNS = tuple(EXPDECAY_COLUMNS) + tuple(DEXP_COLUMNS)
+
+
+def staged_row_values(fit):
+    """The STAGED_COLUMNS values of one fit_staged() result, rounded for a CSV."""
+    return expdecay_row_values(fit["early"]) + dexp_row_values(fit["bump"])
+
+
+def empty_staged():
+    """A fit_staged()-shaped result with everything nan / fit_ok 0.
+
+    Used for a row where the kinetics were not measured at all -- a short-window simulation,
+    or a neuron skipped by the long-window subsample. It keeps the CSV schema constant: every
+    row has the same columns, and an unmeasured one is blank rather than absent.
+    """
+    nan = float("nan")
+    empty = np.array([])
+    return dict(early=fit_exp_decay(empty, empty), bump=fit_double_exp_from_zero(empty, empty))

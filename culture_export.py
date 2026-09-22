@@ -63,9 +63,19 @@ LEGACY_CSV_HEADER = ["culture", "neuron", "morphology", "layer_um", "x_um", "y_u
 # Current raw schema = legacy columns (unchanged order) + soma-only provenance and outcomes.
 # 'seed' is the RNG base actually used for that row's culture: culture_merge.py uses the
 # (seed, culture) pair to tell a true duplicate from an independent replicate.
-CSV_HEADER = LEGACY_CSV_HEADER + ["cell_model", "v_rest_mV", "ctrl_drift_mV",
-                                  "deltaVm_end_phase2_mV", "phase2_outcome",
-                                  "depolarized", "hyperpolarized"]
+# ... + the post-pulse kinetics (bump_kinetics.STAGED_COLUMNS). Every row carries them; a
+# row whose kinetics were not measured (bump_ms = 0, or a culture outside the long-window
+# subsample) has them BLANK, never absent -- the schema is constant across a campaign.
+from bump_kinetics import (STAGED_COLUMNS, common_prefix_len, empty_staged, fit_staged,
+                           staged_row_values)
+# The 22 columns of the soma-only campaign, BEFORE the post-pulse kinetics were added. Parts
+# written with exactly this header are still read (read-only), so the existing
+# results_soma_only/ tree keeps merging and analysing unchanged. culture_merge.py refuses to
+# mix schemas, so an old part and a new one can never end up in one merged file.
+OUTCOME_CSV_HEADER = LEGACY_CSV_HEADER + ["cell_model", "v_rest_mV", "ctrl_drift_mV",
+                                          "deltaVm_end_phase2_mV", "phase2_outcome",
+                                          "depolarized", "hyperpolarized"]
+CSV_HEADER = OUTCOME_CSV_HEADER + list(STAGED_COLUMNS)
 OUTCOME_COLS = ("fired", "depolarized", "hyperpolarized")
 # outcome name -> (file-name stem, 0/1 column). MUST match culture_statistics.OUTCOMES
 # (checked by smoke_test_culture_statistics.py).
@@ -74,7 +84,7 @@ OUTCOME_FILES = {
     "depolarization": ("Pdepolarization", "depolarized"),
     "hyperpolarization": ("Phyperpolarization", "hyperpolarized"),
 }
-CELL_MODELS = ("soma_only", "full_active")
+CELL_MODELS = ("soma_only", "full_active", "full_tuned")
 PHASE2_EPS_MV = 1e-6      # |DeltaV_end| <= eps -> 'neutral' (numerically zero)
 
 
@@ -647,6 +657,7 @@ def build_row(culture, neuron, morph, layer, x_um, y_um, d_near, d_cen, r_dip, t
            prep["cell_model"], round(float(prep["v_rest"]), 4),
            round(float(prep["ctrl_drift"]), 6), round(float(res["dv_end"]), 6),
            res["outcome"], int(res["depolarized"]), int(res["hyperpolarized"])]
+    row += staged_row_values(res.get("kinetics") or empty_staged())
     if len(row) != len(CSV_HEADER):
         raise AssertionError("build_row: %d values for %d columns" % (len(row), len(CSV_HEADER)))
     return row
@@ -758,9 +769,46 @@ def resolve_cell_model(cfg_or_name):
 
 
 def build_cell_for_model(asc_path, cell_model):
-    """Build the Rich cell with the biophysics of `cell_model` (see the module docstring)."""
+    """Build the Rich cell with the biophysics of `cell_model` (see the module docstring).
+
+    full_tuned uses Rich's OWN axon, which is passive: axon_active=False drops the Eyal Na/Kv
+    from the stylized AIS. That is what makes the leak tuning safe for excitability -- moving
+    a passive axon's potential touches no sodium channel (measured: identical spike counts,
+    peak Vm shifted by <= 0.0475 mV). The tuning itself is applied in _rest_and_sham(), after
+    every channel and every config multiplier is in place.
+    """
     from rich_cell import build_rich_cell
-    return build_rich_cell(asc_path, soma_only=(resolve_cell_model(cell_model) == "soma_only"))
+    name = resolve_cell_model(cell_model)
+    return build_rich_cell(asc_path, soma_only=(name == "soma_only"),
+                           axon_active=(name != "full_tuned"))
+
+
+def apply_model_state(cell, cell_model, cfg, v_target_mV):
+    """Per-build biophysical state that is NOT part of the morphology and must therefore be
+    re-applied every time the cell is rebuilt.
+
+    Today that is the full_tuned leak tuning: e_pas is set per segment so the net standing
+    current is zero at `v_target_mV`, imposing that potential isopotentially across the whole
+    arbour. It is temperature-dependent (eca is Nernst-computed), hence the explicit celsius.
+
+    WHY THIS IS SEPARATE FROM _rest_and_sham: CellPool keeps ONE live cell and rebuilds it
+    whenever the morphology or layer changes, but it computes rest and the sham only ONCE per
+    (morphology, layer) and caches them. If the tuning lived only in that cached path, every
+    rebuild after the first would hand back an UNTUNED cell while the stored sham still came
+    from a tuned one -- and the mismatch shows up as a large, placement-independent DeltaV.
+    Measured before this was split out: a spurious 0.409 mV 'bump' with near-degenerate taus,
+    identical at 370 and 500 um. smoke_test_full_tuned.py now asserts that a rebuild
+    reproduces the same DeltaV.
+
+    Returns the tuning report (dict) or None when the model needs no per-build state.
+    """
+    if resolve_cell_model(cell_model) != "full_tuned":
+        return None
+    if not bool(getattr(cfg, "leak_tuning", True)):
+        return None
+    from rich_cell import tune_leak_isopotential
+    return tune_leak_isopotential(cell, float(v_target_mV),
+                                  celsius=float(getattr(cfg, "leak_tune_celsius", 37.0)))
 
 
 def _rest_and_sham(cell, cell_model, cfg, morph, layer, rest_tstop_ms=1500.0):
@@ -774,12 +822,22 @@ def _rest_and_sham(cell, cell_model, cfg, morph, layer, rest_tstop_ms=1500.0):
       ctrl_drift : v_sham_end - v_rest, the init drift that DeltaV_end removes."""
     from rich_cell import settled_resting_voltage
     from rich_footprint import spikes_at
-    if cell_model == "soma_only":
-        v_rest = float(settled_resting_voltage(cell, tstop_ms=rest_tstop_ms, dt_ms=cfg.dt_ms))
-    else:
+    if cell_model == "full_active":
         v_rest = float(cfg.v_rest_mV)
-    n0, _vmax0, tw0, vw0 = spikes_at(cell, (0.0, 0.0), 0.0, i0_uA=0.0, detail=True,
-                                     pre_end_ms=0.0, v_init_mV=v_rest)
+    else:
+        v_rest = float(settled_resting_voltage(cell, tstop_ms=rest_tstop_ms, dt_ms=cfg.dt_ms))
+    leak = apply_model_state(cell, cell_model, cfg, v_rest)
+
+    bump_ms = float(getattr(cfg, "bump_ms", 0.0) or 0.0)
+    kin = dict(bump_ms=bump_ms, bump_dt_ms=float(getattr(cfg, "bump_dt_ms", 0.5)),
+               cvode_atol=float(getattr(cfg, "cvode_atol", 1e-6)),
+               play_margin_ms=float(getattr(cfg, "play_margin_ms", 1.0)),
+               t0_ms=float(getattr(cfg, "bump_t0_ms", 0.0)),
+               early_floor=float(getattr(cfg, "bump_early_floor", 0.25)))
+    out = spikes_at(cell, (0.0, 0.0), 0.0, i0_uA=0.0, detail=True, pre_end_ms=0.0,
+                    v_init_mV=v_rest, bump_ms=bump_ms, bump_dt_ms=kin["bump_dt_ms"],
+                    cvode_atol=kin["cvode_atol"], play_margin_ms=kin["play_margin_ms"])
+    n0, _vmax0, tw0, vw0 = out[0], out[1], out[2], out[3]
     if n0 > 0:
         raise RuntimeError("%s L%d (%s): the cell spikes with ZERO stimulus -- the rest state "
                            "is not quiescent, every outcome would be meaningless"
@@ -788,8 +846,17 @@ def _rest_and_sham(cell, cell_model, cfg, morph, layer, rest_tstop_ms=1500.0):
     if not np.isfinite(v_sham_end):
         raise RuntimeError("%s L%d: sham run returned no sample at the end of phase 2"
                            % (morph, int(layer)))
-    return dict(v_rest=v_rest, v_sham_end=float(v_sham_end),
-                ctrl_drift=float(v_sham_end - v_rest))
+    # The sham traces are kept so DeltaV(t) can be formed over the WHOLE window, not just at
+    # t_end. With I = 0 the extracellular drive is zero everywhere, so one sham serves every
+    # placement of this cell. Two grids: the solver-resolution one (the fast relaxation lives
+    # there) and the uniform bump_dt_ms one (the bump).
+    info = dict(v_rest=v_rest, v_sham_end=float(v_sham_end),
+                ctrl_drift=float(v_sham_end - v_rest), leak_report=leak, kin=kin,
+                t_fine_sham=np.asarray(tw0, float), v_fine_sham=np.asarray(vw0, float))
+    if bump_ms > 0:
+        info["t_grid_sham"] = np.asarray(out[4], float)
+        info["v_grid_sham"] = np.asarray(out[5], float)
+    return info
 
 
 def prepare_cell(morph, layer, cfg=None, cell_model=None, tag="_ce_", rest_tstop_ms=1500.0):
@@ -813,19 +880,50 @@ def prepare_cell(morph, layer, cfg=None, cell_model=None, tag="_ce_", rest_tstop
     return dict(cell=cell, morph=str(morph), layer=float(layer), cell_model=cell_model, **info)
 
 
-def simulate_neuron(prep, pos_xy, theta_deg, i0_uA):
+def simulate_neuron(prep, pos_xy, theta_deg, i0_uA, with_kinetics=True):
     """ONE stimulation of a prepared cell (prepare_cell) placed at `pos_xy` (um), rotated by
     `theta_deg`. Same protocol as the sham (rich_footprint.spikes_at defaults, v_init = v_rest).
-    Returns dict(fired, dv_end, outcome, depolarized, hyperpolarized),
-    dv_end = Vm(t_end) - Vm_sham(t_end)."""
+
+    Returns dict(fired, dv_end, outcome, depolarized, hyperpolarized, kinetics),
+    dv_end = Vm(t_end) - Vm_sham(t_end).
+
+    `kinetics` is a bump_kinetics.fit_staged() result: the direct post-pulse relaxation and
+    the Ih bump, both measured on DeltaV(t) = Vm_stim(t) - Vm_sham(t). It is empty_staged()
+    (all blank, fit_ok 0) when config.bump_ms is 0 or `with_kinetics` is False, so the row
+    schema never changes. The outcome columns are NOT affected by the long window: the pulse
+    is integrated at fixed dt either way and t_end precedes the switch to CVODE (verified
+    identical to 0.00e+00 mV).
+    """
     from rich_footprint import spikes_at
-    nsp, _vmax, tw, vw = spikes_at(prep["cell"], (float(pos_xy[0]), float(pos_xy[1])),
-                                   float(theta_deg), i0_uA=float(i0_uA), detail=True,
-                                   pre_end_ms=0.0, v_init_mV=prep["v_rest"])
+    kin = prep.get("kin") or {}
+    bump_ms = float(kin.get("bump_ms", 0.0)) if with_kinetics else 0.0
+    out = spikes_at(prep["cell"], (float(pos_xy[0]), float(pos_xy[1])), float(theta_deg),
+                    i0_uA=float(i0_uA), detail=True, pre_end_ms=0.0,
+                    v_init_mV=prep["v_rest"], bump_ms=bump_ms,
+                    bump_dt_ms=float(kin.get("bump_dt_ms", 0.5)),
+                    cvode_atol=float(kin.get("cvode_atol", 1e-6)),
+                    play_margin_ms=float(kin.get("play_margin_ms", 1.0)))
+    nsp, tw, vw = out[0], out[2], out[3]
     dv_end = v_at_end_of_phase2(tw, vw) - prep["v_sham_end"]
     label, act, depo, hypo = phase2_end_outcome(int(nsp > 0), dv_end)
+
+    fit = empty_staged()
+    if bump_ms > 0 and "t_grid_sham" in prep:
+        # fine DeltaV: the leading stretch where the stimulated and the sham run share their
+        # fixed-dt time base exactly, so this is a plain subtraction with no interpolation.
+        k = common_prefix_len(tw, prep["t_fine_sham"])
+        tf, vf = tw[:k], (vw[:k] - prep["v_fine_sham"][:k])
+        tg = np.asarray(out[4], float)
+        vg = tg * 0.0
+        tgs, vgs = prep["t_grid_sham"], prep["v_grid_sham"]
+        if tgs.shape == tg.shape and np.allclose(tgs, tg, rtol=0.0, atol=1e-9):
+            vg = np.asarray(out[5], float) - vgs
+        else:
+            vg = np.asarray(out[5], float) - np.interp(tg, tgs, vgs)
+        fit = fit_staged(tf, vf, tg, vg, t0_ms=float(kin.get("t0_ms", 0.0)),
+                         early_floor=float(kin.get("early_floor", 0.25)))
     return dict(fired=act, dv_end=float(dv_end), outcome=label,
-                depolarized=depo, hyperpolarized=hypo)
+                depolarized=depo, hyperpolarized=hypo, kinetics=fit)
 
 
 class CellPool(object):
@@ -876,8 +974,15 @@ class CellPool(object):
         self._key = key
         self.n_builds += 1
         if key not in self._info:
+            # first build of this (morphology, layer): settle, tune, and run the sham
             self._info[key] = _rest_and_sham(self._cell, self.cell_model, self.cfg,
                                              key[0], key[1], self.rest_tstop_ms)
+        else:
+            # a REBUILD. rest and the sham are cached, but the per-build biophysical state is
+            # not part of the .asc and has to be re-applied, or this cell is not the cell the
+            # cached sham came from. Cheap: one finitialize + fcurrent, no 1500 ms settle.
+            apply_model_state(self._cell, self.cell_model, self.cfg,
+                              self._info[key]["v_rest"])
         return key
 
     def info(self, morph, layer):
@@ -888,11 +993,13 @@ class CellPool(object):
             self._activate(*key)
         return dict(morph=key[0], layer=key[1], cell_model=self.cell_model, **self._info[key])
 
-    def simulate(self, morph, layer, pos_xy, theta_deg, i0_uA):
+    def simulate(self, morph, layer, pos_xy, theta_deg, i0_uA, with_kinetics=True):
         """Biphasic stimulation + classification (simulate_neuron) of (morph, layer) placed at
-        pos_xy / theta_deg."""
+        pos_xy / theta_deg. with_kinetics=False skips the long post-pulse window for this one
+        simulation (the outcome columns are unaffected)."""
         key = self._activate(morph, layer)
-        return simulate_neuron(dict(cell=self._cell, **self._info[key]), pos_xy, theta_deg, i0_uA)
+        return simulate_neuron(dict(cell=self._cell, **self._info[key]), pos_xy, theta_deg,
+                               i0_uA, with_kinetics=with_kinetics)
 
     def n_spikes(self, morph, layer, pos_xy, theta_deg, i0_uA, phase="both"):
         """Somatic spike count only (phase='p1'/'p2' = monophasic delivery, for phase_split)."""
@@ -914,7 +1021,24 @@ class CellPool(object):
         return False
 
 
-def iter_culture_blocks(pool, c, d, morphs, layers, i0, n_pulses, seed, block=25):
+def culture_has_kinetics(seed, c, fraction=1.0):
+    """Whether culture `c` gets the long post-pulse window.
+
+    Deterministic in (seed, c) and drawn from a stream INDEPENDENT of culture_draws(), so
+    changing the fraction -- or turning the subsample off entirely -- cannot move a single
+    soma. Subsampling by CULTURE rather than by neuron keeps the kinetics sample unbiased in
+    distance and orientation, which restricting the window by position would not.
+    """
+    f = float(fraction)
+    if f >= 1.0:
+        return True
+    if f <= 0.0:
+        return False
+    return bool(np.random.default_rng([int(seed) + int(c), 0x6B696E]).random() < f)
+
+
+def iter_culture_blocks(pool, c, d, morphs, layers, i0, n_pulses, seed, block=25,
+                        with_kinetics=True):
     """Simulate culture `c` (draws `d` from culture_draws) in BLOCKS of `block` neurons; yield
     (rows, n_neurons_done) after each block. Shared by the serial driver and the worker.
 
@@ -925,6 +1049,7 @@ def iter_culture_blocks(pool, c, d, morphs, layers, i0, n_pulses, seed, block=25
     of COMPLETE neurons (the flush happens between blocks, see culture_worker.py)."""
     N = len(d["midx"])
     block = max(1, int(block))
+    with_kinetics = bool(with_kinetics)
     for b0 in range(0, N, block):
         idx = list(range(b0, min(N, b0 + block)))
         res = {}
@@ -934,7 +1059,8 @@ def iter_culture_blocks(pool, c, d, morphs, layers, i0, n_pulses, seed, block=25
                 continue
             for layer in layers:
                 for i in members:
-                    res[(i, layer)] = pool.simulate(morph, layer, d["pos"][i], d["theta"][i], i0)
+                    res[(i, layer)] = pool.simulate(morph, layer, d["pos"][i], d["theta"][i],
+                                                    i0, with_kinetics=with_kinetics)
         rows = []
         for i in idx:
             morph = morphs[int(d["midx"][i])]
@@ -1026,12 +1152,15 @@ def culture_export(n_cultures=None, neurons_per_culture=None, layers=None,
             for c in range(n_cultures):
                 d = culture_draws(seed_used, c, N, M, span, elec, center, dip_c, dip_d, axis,
                                   cfg.h_soma_um)
+                wk = culture_has_kinetics(seed_used, c,
+                                          getattr(cfg, "bump_culture_fraction", 1.0))
                 for rows, _n_done in iter_culture_blocks(pool, c, d, morphs, layers, i0,
-                                                         n_pulses, seed_used, block):
+                                                         n_pulses, seed_used, block,
+                                                         with_kinetics=wk):
                     for row in rows:
                         ow.write(row)
                         plot.append([float(row[j]) for j in pcols])
-                print(f"  culture {c}: done")
+                print(f"  culture {c}: done{'' if wk else '  (kinetics skipped)'}")
         paths = ow.paths
         print("  cell builds: %d (one live cell at a time)" % pool.n_builds)
     print("done CSVs:", ", ".join(paths[k] for k in OUTCOME_FILES))

@@ -50,10 +50,13 @@ from collections import Counter
 
 import numpy as np
 
-from culture_export import (CELL_MODELS, CSV_HEADER, LEGACY_CSV_HEADER, OutcomeWriter,
+from culture_export import (CELL_MODELS, CSV_HEADER, LEGACY_CSV_HEADER, OUTCOME_CSV_HEADER,
+                            OutcomeWriter,
                             PLOT_COLUMNS)
 
-SCHEMAS = {tuple(CSV_HEADER): "current", tuple(LEGACY_CSV_HEADER): "legacy_full_active"}
+SCHEMAS = {tuple(CSV_HEADER): "current",
+           tuple(OUTCOME_CSV_HEADER): "legacy_outcomes_no_kinetics",
+           tuple(LEGACY_CSV_HEADER): "legacy_full_active"}
 # LEGACY_CSV_HEADER is a prefix of CSV_HEADER, so these indices hold for BOTH schemas
 _CULTURE, _NEURON, _LAYER, _I0, _PULSES, _SEED = (
     CSV_HEADER.index(k) for k in ("culture", "neuron", "layer_um", "i0_uA", "n_pulses", "seed"))
@@ -121,8 +124,12 @@ def scan_parts(part_files, expect_model=None):
             header = next(csv.reader(fh), None)
         schema = SCHEMAS.get(tuple(header or ()))
         if schema is None:
-            raise SystemExit("%s: unexpected header\n  got      %s\n  expected %s\n  or legacy %s"
-                             % (f, header, CSV_HEADER, LEGACY_CSV_HEADER))
+            raise SystemExit("%s: unexpected header (%d columns)\n  got      %s\n  "
+                             "expected one of the %d known schemas:\n    current (%d cols) %s"
+                             "\n    legacy_outcomes_no_kinetics (%d cols)\n    "
+                             "legacy_full_active (%d cols)"
+                             % (f, len(header or ()), header, len(SCHEMAS), len(CSV_HEADER),
+                                CSV_HEADER, len(OUTCOME_CSV_HEADER), len(LEGACY_CSV_HEADER)))
         if s.schema is None:
             s.schema, s.header = schema, list(header)
         elif schema != s.schema:

@@ -77,10 +77,9 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 
-from bump_kinetics import (DEXP_COLUMNS, EXPDECAY_COLUMNS, dexp_row_values,
-                           eval_bump_component, eval_exp_decay, eval_offset_component,
-                           expdecay_row_values, fit_double_exp_from_zero, fit_exp_decay,
-                           fit_post_pulse)
+from bump_kinetics import (STAGED_COLUMNS, common_prefix_len, eval_bump_component,
+                           eval_exp_decay, eval_offset_component, fit_post_pulse, fit_staged,
+                           staged_row_values)
 
 # --- palette -----------------------------------------------------------------------------
 # Okabe-Ito, in fixed order, validated for colour-vision deficiency against a light surface
@@ -89,6 +88,7 @@ from bump_kinetics import (DEXP_COLUMNS, EXPDECAY_COLUMNS, dexp_row_values,
 C_DATA = "#0072B2"          # the measured trace
 C_BUMP = "#009E73"          # the bump component (double exponential)
 C_POL = "#E69F00"           # the polarisation component (single exponential)
+C_MODEL = "#D55E00"         # the reconstruction: both fitted components summed
 C_SHAM = "#7f7f7f"          # sham trajectory (a reference, not a result)
 C_INK = "#1a1a1a"
 C_INK2 = "#5a5a5a"
@@ -206,21 +206,6 @@ def sham_reference(inst, proto):
     return dict(t_fine=tw, v_fine=vw, t_grid=tb, v_grid=vb)
 
 
-def _common_prefix(t_a, t_b, atol=1e-9):
-    """Length of the leading run over which two solver time bases agree exactly.
-
-    Both runs integrate at FIXED dt up to t_end + play_margin_ms, so their step times are
-    identical there and DeltaV can be formed by plain subtraction -- no interpolation, no
-    interpolation error, on precisely the stretch where the trace moves fastest. After that
-    CVODE adapts independently in the two runs and the time bases diverge.
-    """
-    n = int(min(t_a.size, t_b.size))
-    if n == 0:
-        return 0
-    bad = np.nonzero(np.abs(t_a[:n] - t_b[:n]) > atol)[0]
-    return int(bad[0]) if bad.size else n
-
-
 def simulate_instance(inst, proto, sham, pos_xy, theta_deg):
     """Stimulate this instance at (pos_xy, theta_deg) and form DeltaV against the sham.
 
@@ -238,7 +223,7 @@ def simulate_instance(inst, proto, sham, pos_xy, theta_deg):
     else:
         vb_sham = np.interp(tb, tbs, vbs)           # should not happen; correct if it does
 
-    k = _common_prefix(tw, sham["t_fine"])
+    k = common_prefix_len(tw, sham["t_fine"])
     if k < 10:
         raise RuntimeError("stimulated and sham runs share only %d fixed-dt samples -- the "
                            "fast polarisation cannot be measured. Raise play_margin_ms." % k)
@@ -298,13 +283,10 @@ def analyse(rec, mode="staged", t0_ms=0.0, t_peak_search_ms=2.0, early_floor=0.2
         early_f = eval_exp_decay(t_f, early)
         resid_f, resid_g = early_f, eval_exp_decay(t_g, early)
     else:
-        # stage 1: the fast relaxation, on the exact fine DeltaV only
-        early = fit_exp_decay(t_f, dv_f, t0_ms=t0_ms, t_peak_search_ms=t_peak_search_ms,
-                              t_max_ms=float(t_f[-1]), floor_fraction=float(early_floor))
-        # stage 2: the bump on the long window, with tau_m held fixed from stage 1
-        bump = fit_double_exp_from_zero(t_g, dv_g, t0_ms=t0_ms,
-                                        tau_offset_ms=early["tau_ms"],
-                                        min_amp_mV=min_amp_mV, min_r2=min_r2)
+        st = fit_staged(t_f, dv_f, t_g, dv_g, t0_ms=t0_ms,
+                        t_peak_search_ms=t_peak_search_ms, early_floor=early_floor,
+                        min_amp_mV=min_amp_mV, min_r2=min_r2)
+        early, bump = st["early"], st["bump"]
         early_f = eval_exp_decay(t_f, early)
         resid_f = eval_offset_component(t_f, bump)
         resid_g = eval_offset_component(t_g, bump)
@@ -354,12 +336,33 @@ def _fmt(x, w=8, d=3):
     return ("%*.*f" % (w, d, x)) if np.isfinite(x) else ("%*s" % (w, "n/a"))
 
 
+def reconstruction(rec, fit):
+    """The fitted trace put back into absolute Vm, on the uniform grid.
+
+        Vm_model(t) = Vm_sham(t) + DeltaV_model(t),
+        DeltaV_model = the direct polarisation component + the bump component
+
+    Both components are evaluated from the SAME fit the lower panels draw, so the top panel is
+    not an independent claim -- it is those two curves summed and referred back to the sham.
+    Returns (t, Vm_model, residual) on rec's uniform grid, all nan before t0. The residual is
+    measured minus model, computed on that grid with no interpolation: the measured Vm is
+    recorded on it directly.
+    """
+    t = rec["t_grid"]
+    vm_model = rec["v_grid_sham"] + fit["model_grid"]
+    return t, vm_model, rec["v_grid"] - vm_model
+
+
 def plot_timecourse(ax, rec, fit, phi, bump_ms):
-    """Top panel: the soma Vm, the stimulus, and the two marked points."""
+    """Top panel: the soma Vm, the stimulus, the two marked points, and the reconstruction."""
     t, v = rec["t_fine"], rec["v_fine"]
     ax.plot(rec["t_fine_sham"], rec["v_fine_sham"], color=C_SHAM, ls="--", lw=1.0, zorder=3,
             label="sham (I = 0)")
     ax.plot(t, v, color=C_DATA, lw=1.4, zorder=4, label="soma Vm (stimulated)")
+    tm, vm_model, _res = reconstruction(rec, fit)
+    fin = np.isfinite(vm_model)
+    ax.plot(tm[fin], vm_model[fin], color=C_MODEL, ls="--", lw=1.8, zorder=6,
+            label="reconstruction = sham + both fitted components")
     _shade_pulse(ax, phi, label=True)
 
     # y-limits from the POST-pulse trace: the in-pulse excursion is an extracellular artefact
@@ -367,6 +370,9 @@ def plot_timecourse(ax, rec, fit, phi, bump_ms):
     post = t >= 0.0
     lo = min(float(np.min(v[post])), float(np.min(rec["v_fine_sham"])))
     hi = max(float(np.max(v[post])), float(np.max(rec["v_fine_sham"])))
+    if fin.any():                                  # the model must not be clipped out of view
+        lo = min(lo, float(np.min(vm_model[fin])))
+        hi = max(hi, float(np.max(vm_model[fin])))
     pad = 0.18 * (hi - lo + 1e-9)
     ax.set_ylim(lo - pad, hi + pad)
     inp = (t >= -2.0 * phi) & (t < 0.0)
@@ -406,12 +412,39 @@ def plot_timecourse(ax, rec, fit, phi, bump_ms):
                     arrowprops=dict(arrowstyle="-", color=C_INK2, lw=0.7, alpha=0.85))
 
     ax.set_xlim(-2.0 * phi - 0.02 * bump_ms, bump_ms)
-    _style(ax, "time from end of phase 2 (ms)", "soma Vm (mV)")
+    _style(ax, "", "soma Vm (mV)")
+    ax.tick_params(labelbottom=False)
     if clipped:
         ax.text(1.0, 1.02, "in-pulse excursion clipped -- see the lower-left panel",
                 transform=ax.transAxes, fontsize=7, color=C_INK2, va="bottom", ha="right")
     ax.legend(fontsize=7, loc="upper right", frameon=True, framealpha=0.92,
               edgecolor=C_GRID, ncol=2)
+    return tm, _res
+
+
+def plot_residual(ax, t_res, res, phi, bump_ms):
+    """The strip under the timecourse: measured Vm minus the reconstruction.
+
+    This is the panel that makes the fit falsifiable. A structured residual -- a slow arc, a
+    step, a ringing -- means the two-component model is missing something; scatter about zero
+    means it is not.
+    """
+    fin = np.isfinite(res)
+    ax.axhline(0.0, color=C_INK2, lw=0.8, ls=":", zorder=2)
+    if fin.any():
+        ax.plot(t_res[fin], res[fin], color=C_MODEL, lw=1.1, zorder=4)
+        r = res[fin]
+        rms = float(np.sqrt(np.mean(r ** 2)))
+        mx = float(np.max(np.abs(r)))
+        lim = max(1.2 * mx, 1e-4)
+        ax.set_ylim(-lim, lim)
+        ax.text(0.995, 0.90, "residual  RMS %.4f mV   max |.| %.4f mV" % (rms, mx),
+                transform=ax.transAxes, ha="right", va="top", fontsize=6.8, color=C_INK,
+                family="monospace",
+                bbox=dict(boxstyle="round,pad=0.25", fc="white", ec=C_GRID, lw=0.7,
+                          alpha=0.92))
+    ax.set_xlim(-2.0 * phi - 0.02 * bump_ms, bump_ms)
+    _style(ax, "time from end of phase 2 (ms)", "measured -\nmodel (mV)")
 
 
 def plot_polarisation(ax, rec, fit, phi):
@@ -514,15 +547,22 @@ def plot_bump(ax, rec, fit, bump_ms):
     ax.legend(fontsize=6.6, loc="lower right", frameon=True, framealpha=0.92, edgecolor=C_GRID)
 
 
-def plot_instance(rec, fit, inst, proto, figsize=(11.5, 8.0)):
+def plot_instance(rec, fit, inst, proto, figsize=(11.5, 9.0)):
     """One finished page. Runs no simulation and no fitting -- pass it finished arrays."""
     phi = float(proto["phase_dur_ms"])
     fig = plt.figure(figsize=figsize)
-    gs = fig.add_gridspec(2, 2, height_ratios=[1.12, 1.0], hspace=0.46, wspace=0.22,
-                          left=0.065, right=0.985, top=0.855, bottom=0.105)
-    plot_timecourse(fig.add_subplot(gs[0, :]), rec, fit, phi, proto["bump_ms"])
-    note = plot_polarisation(fig.add_subplot(gs[1, 0]), rec, fit, phi)
-    plot_bump(fig.add_subplot(gs[1, 1]), rec, fit, proto["bump_ms"])
+    # Two blocks, each with its own spacing: the timecourse and its residual are glued
+    # together (they share an x axis and must read as one panel), the fits below need room
+    # for their own titles and x labels.
+    outer = fig.add_gridspec(2, 1, height_ratios=[1.35, 0.95], hspace=0.30,
+                             left=0.075, right=0.985, top=0.855, bottom=0.095)
+    top = outer[0].subgridspec(2, 1, height_ratios=[1.05, 0.30], hspace=0.08)
+    ax_top = fig.add_subplot(top[0])
+    t_res, res = plot_timecourse(ax_top, rec, fit, phi, proto["bump_ms"])
+    plot_residual(fig.add_subplot(top[1], sharex=ax_top), t_res, res, phi, proto["bump_ms"])
+    bot = outer[1].subgridspec(1, 2, wspace=0.22)
+    note = plot_polarisation(fig.add_subplot(bot[0]), rec, fit, phi)
+    plot_bump(fig.add_subplot(bot[1]), rec, fit, proto["bump_ms"])
     if note:
         fig.text(0.065, 0.016, note, fontsize=6.8, color=C_INK2, ha="left", va="bottom")
 
@@ -548,7 +588,7 @@ def plot_instance(rec, fit, inst, proto, figsize=(11.5, 8.0)):
 # ===========================================================================
 CSV_HEADER = (["cell_model", "morph", "layer_um", "x_um", "y_um", "r_um", "theta_deg",
                "i0_uA", "bump_ms", "fit_mode", "fired", "v_rest_mV"]
-              + list(EXPDECAY_COLUMNS) + list(DEXP_COLUMNS)
+              + list(STAGED_COLUMNS)
               + ["bump_data_peak_mV", "bump_data_t_peak_ms"])
 
 
@@ -594,7 +634,7 @@ def _row(inst, proto, rec, fit):
     return ([inst["cell_model"], inst["morph"], int(inst["layer"]), rec["pos_xy"][0],
              rec["pos_xy"][1], round(rec["r_um"], 2), rec["theta_deg"], proto["i0_uA"],
              proto["bump_ms"], fit["mode"], rec["fired"], round(inst["v_rest"], 4)]
-            + expdecay_row_values(fit["early"]) + dexp_row_values(b)
+            + staged_row_values(fit)
             + [rnd(b["data_peak_mV"], 6), rnd(b["data_t_peak_ms"], 3)])
 
 

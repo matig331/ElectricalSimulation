@@ -21,7 +21,8 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from culture_worker import CSV_HEADER, parse_ids, split_ids
-from culture_export import LEGACY_CSV_HEADER
+from culture_export import LEGACY_CSV_HEADER, OUTCOME_CSV_HEADER
+from bump_kinetics import empty_staged, staged_row_values
 
 FAILURES = []
 
@@ -114,10 +115,17 @@ try:
     OUT3 = [("activation", 1, 0, 0), ("depol", 0, 1, 0), ("hyperpol", 0, 0, 1),
             ("neutral", 0, 0, 0)]
 
-    def cur_row(c, i, seed=0, layer=40, model="soma_only"):
+    BLANK_KIN = staged_row_values(empty_staged())    # unmeasured kinetics -> empty cells
+
+    def outcomes_row(c, i, seed=0, layer=40, model="soma_only"):
+        """A row in the OUTCOME_CSV_HEADER schema -- what the soma-only campaign wrote."""
         lab, f, dp, hp = OUT3[i % 4]
         return [c, i, "60303", layer, 1.0 * i, 2.0 * i, 10.0, 20.0, 21.0, 30.0, 40.0, 36,
                 50.0, f, seed, model, -83.18, 0.0896, 0.01 * (i % 4 - 1.5), lab, dp, hp]
+
+    def cur_row(c, i, seed=0, layer=40, model="soma_only"):
+        """The CURRENT schema: the same outcomes plus blank kinetics columns."""
+        return outcomes_row(c, i, seed, layer, model) + list(BLANK_KIN)
 
     def write_part(path, cultures, rows_per_culture=6, header=None, seed=0, layers=(40,),
                    model="soma_only"):
@@ -128,6 +136,15 @@ try:
                 for i in range(rows_per_culture):
                     for lay in layers:                  # neuron-major, like the worker
                         w.writerow(cur_row(c, i, seed, lay, model))
+
+    def write_outcomes_part(path, cultures, rows_per_culture=6, seed=0):
+        """A part in the pre-kinetics soma-only schema -- an EXISTING results_soma_only part."""
+        with open(path, "w", newline="") as fh:
+            w = csv.writer(fh)
+            w.writerow(OUTCOME_CSV_HEADER)
+            for c in cultures:
+                for i in range(rows_per_culture):
+                    w.writerow(outcomes_row(c, i, seed))
 
     def write_legacy_part(path, cultures, rows_per_culture=6, seed=0):
         with open(path, "w", newline="") as fh:
@@ -168,6 +185,29 @@ try:
         check("same-seed overlapping cultures rejected", False, "(no exception raised)")
     except SystemExit:
         check("same-seed overlapping cultures rejected", True)
+
+    # THE REGRESSION THAT MATTERS: the existing soma-only campaign was written before the
+    # kinetics columns existed. Adding them to CSV_HEADER must not make those parts unreadable.
+    old_dir = os.path.join(tmp, "old_schema")
+    os.makedirs(old_dir)
+    write_outcomes_part(os.path.join(old_dir, "part_00.csv"), [0, 1])
+    old_rows, old_counts = culture_merge.read_parts(
+        [os.path.join(old_dir, "part_00.csv")])
+    check("a pre-kinetics soma-only part still merges (%d rows, %d cultures)"
+          % (len(old_rows), len(old_counts)),
+          len(old_rows) == 12 and sorted(old_counts) == [(0, 0), (0, 1)])
+    check("...and its rows keep the OLD width (%d, not %d)"
+          % (len(old_rows[0]), len(CSV_HEADER)),
+          len(old_rows[0]) == len(OUTCOME_CSV_HEADER))
+
+    # mixing an old part with a current one is REFUSED, not silently padded
+    mix_dir = os.path.join(tmp, "mixed_schema")
+    os.makedirs(mix_dir)
+    write_outcomes_part(os.path.join(mix_dir, "part_00.csv"), [0])
+    write_part(os.path.join(mix_dir, "part_01.csv"), [1])
+    check("mixing a pre-kinetics part with a current one is refused",
+          rejected(culture_merge.read_parts,
+                   sorted(os.path.join(mix_dir, f) for f in os.listdir(mix_dir))))
 
     # a wrong header must be caught
     bad_dir = os.path.join(tmp, "bad")
