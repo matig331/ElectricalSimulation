@@ -27,7 +27,8 @@ from bump_kinetics import (DEXP_COLUMNS, EXPDECAY_COLUMNS, KINETICS_COLUMNS,
                            POSTPULSE_COLUMNS, _dexp_design, dexp_row_values,
                            eval_double_exp_from_zero, eval_exp_decay, expdecay_row_values,
                            fit_double_exp_from_zero, fit_exp_decay, fit_ih_bump,
-                           fit_post_pulse, kinetics_row_values, postpulse_row_values)
+                           fit_post_pulse, fit_staged, kinetics_row_values,
+                           postpulse_row_values)
 
 FAILURES = []
 
@@ -304,6 +305,36 @@ check("eval_* on an empty fit return all-nan, no exception",
       np.all(np.isnan(eval_exp_decay(TT, fit_exp_decay(TT[:3], np.zeros(3)))))
       and np.all(np.isnan(eval_double_exp_from_zero(TT, fit_double_exp_from_zero(TT[:3],
                                                                                  np.zeros(3))))))
+
+print("\n[13b] a relaxation FASTER than the fine grid (seen on the cluster)")
+# t_1e = 0.011 ms on a 0.025 ms grid: stage 1 cannot fit, and the bump fit must not then
+# assume the residual is SLOW. Built exactly to that case.
+_P, _tm, _tr, _td = 0.107, 0.010, 65.0, 180.0
+_u = np.linspace(0, 2000, 200001)
+_Ab = 0.40 / np.max(np.exp(-_u / _td) - np.exp(-_u / _tr))
+_dv = lambda t: _P * np.exp(-t / _tm) + _Ab * (np.exp(-t / _td) - np.exp(-t / _tr))
+_tf = np.arange(0.0, 3.0 + 1e-9, 0.025)
+_tg = np.arange(0.0, 800.0 + 1e-9, 0.5)
+st = fit_staged(_tf, _dv(_tf), _tg, _dv(_tg))
+check("stage 1 correctly declines to fit (tau %s, t_1e %.4f ms < one 0.025 ms sample)"
+      % (st["early"]["tau_ms"], st["early"]["t_1e_ms"]),
+      st["early"]["fit_ok"] == 0 and np.isfinite(st["early"]["t_1e_ms"])
+      and st["early"]["t_1e_ms"] < 0.025)
+check("the bump fit falls back to the MEASURED t_1e, not to tau_rise (source %r)"
+      % st["bump"]["tau_offset_source"], st["bump"]["tau_offset_source"] == "t_1e")
+b_ = st["bump"]
+check("and recovers the bump: tau_r %.2f (65), tau_d %.2f (180), peak %.4f (0.400) mV"
+      % (b_["tau_rise_ms"], b_["tau_decay_ms"], b_["peak_mV"]),
+      abs(b_["tau_rise_ms"] - 65.0) / 65.0 < 0.02 and abs(b_["tau_decay_ms"] - 180.0) / 180.0 < 0.02
+      and abs(b_["peak_mV"] - 0.40) < 0.005 and b_["fit_ok"] == 1)
+old = fit_double_exp_from_zero(_tg, _dv(_tg), tau_offset_ms=None)
+check("...where the OLD fallback was biased (tau_d %.1f ms, %.0f%% off)"
+      % (old["tau_decay_ms"], 100 * abs(old["tau_decay_ms"] - 180.0) / 180.0),
+      abs(old["tau_decay_ms"] - 180.0) / 180.0 > 0.15)
+_dv_ok = lambda t: -1.25 * np.exp(-t / 0.30) + _Ab * (np.exp(-t / _td) - np.exp(-t / _tr))
+ok_case = fit_staged(_tf, _dv_ok(_tf), _tg, _dv_ok(_tg))    # a resolvable 0.3 ms relaxation
+check("when stage 1 DOES fit, its tau is used as before (source %r)"
+      % ok_case["bump"]["tau_offset_source"], ok_case["bump"]["tau_offset_source"] == "fit")
 
 print("\n[14] CSV row helpers for the new fits")
 check("expdecay_row_values matches EXPDECAY_COLUMNS (%d)" % len(EXPDECAY_COLUMNS),

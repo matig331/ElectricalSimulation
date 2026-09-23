@@ -1020,8 +1020,29 @@ def fit_staged(t_fine, dv_fine, t_grid, dv_grid, t0_ms=0.0, t_peak_search_ms=2.0
     early = fit_exp_decay(tf, vf, t0_ms=t0_ms, t_peak_search_ms=t_peak_search_ms,
                           t_max_ms=(float(tf[-1]) if tf.size else float(t0_ms)),
                           floor_fraction=float(early_floor))
-    bump = fit_double_exp_from_zero(tg, vg, t0_ms=t0_ms, tau_offset_ms=early["tau_ms"],
+
+    # tau_offset for the bump fit's residual term, in order of preference:
+    #   fit   the fitted tau_m of stage 1
+    #   t_1e  the MEASURED 1/e time, when stage 1 could not fit
+    #   grid  the fine sample interval, when not even t_1e exists
+    # Stage 1 fails most often because the relaxation is FASTER than the fine grid -- seen on
+    # the cluster at t_1e = 0.011 ms, under one 0.025 ms sample, so fewer than 5 points lie
+    # above the floor. Such a failure means tau_m is tiny, never long. The previous fallback
+    # (tau_rise, ~65 ms) went the wrong way and put a slow 0.1 mV term inside the bump fit:
+    # on a synthetic trace built to that case it returned tau_decay 122 ms against a true
+    # 180 and the peak 14 % low. With t_1e it recovers both exactly.
+    tau_off, src = early["tau_ms"], "fit"
+    if not np.isfinite(tau_off):
+        t1e = early.get("t_1e_ms", float("nan"))
+        if np.isfinite(t1e) and t1e > 0:
+            tau_off, src = float(t1e), "t_1e"
+        elif tf.size > 1:
+            tau_off, src = float(np.median(np.diff(tf))), "grid"
+        else:
+            tau_off, src = None, "tau_rise"
+    bump = fit_double_exp_from_zero(tg, vg, t0_ms=t0_ms, tau_offset_ms=tau_off,
                                     min_amp_mV=min_amp_mV, min_r2=min_r2)
+    bump["tau_offset_source"] = src
     return dict(early=early, bump=bump)
 
 
