@@ -16,7 +16,10 @@
 # OPTIONS (comma-separated after -v)
 #   NEURONS=1000     total neurons PER LAYER. Every neuron is simulated once per layer, so the
 #                    simulation count is NEURONS x (number of layers).
-#   CULTURES=10      how many independent random cultures those neurons are split into.
+#   CULTURES=        how many independent random cultures those neurons are split into.
+#                    DEFAULT: the core count. The work is split BY CULTURE, so a job with
+#                    fewer cultures than cores leaves the extra cores idle -- 10 cultures on
+#                    48 cores uses 10 of them. The job prints the utilisation and warns.
 #   SEED=2000        RNG base. Use a seed no earlier job used, or the placements repeat.
 #   LAYERS=          comma-separated slice thicknesses; default config.layers_um (40,80,120).
 #   BUMP_MS=800      post-pulse window. 0 = no kinetics, and the run costs ~3x less.
@@ -60,7 +63,8 @@ cd "$REPO"; mkdir -p logs
 [ -f jobs/env_setup.sh ] && source jobs/env_setup.sh || echo "NOTE: no jobs/env_setup.sh"
 
 NEURONS="${NEURONS:-1000}"
-CULTURES="${CULTURES:-10}"
+CONC_EARLY="${PBS_NUM_PPN:-${PBS_NP:-$(nproc)}}"
+CULTURES="${CULTURES:-$CONC_EARLY}"      # one culture per core by default: see the note above
 SEED="${SEED:-2000}"
 BUMP_MS="${BUMP_MS:-800}"
 BUMP_FRACTION="${BUMP_FRACTION:-1.0}"
@@ -69,6 +73,8 @@ NAME="${NAME:-ft${NEURONS}_$(date +%Y%m%d_%H%M)}"
 OUT="${OUT:-analysis/$NAME}"
 CONC="${PBS_NUM_PPN:-${PBS_NP:-$(nproc)}}"
 PER_CULTURE=$(( (NEURONS + CULTURES - 1) / CULTURES ))
+[ "$PER_CULTURE" -ge 1 ] || { echo "FATAL: NEURONS ($NEURONS) < CULTURES ($CULTURES)" >&2; exit 2; }
+USED=$(( CULTURES < CONC ? CULTURES : CONC ))
 
 # --- refuse early rather than half way through ----------------------------
 python - "$BUMP_MS" "$BUMP_FRACTION" <<'PY' || exit 2
@@ -101,7 +107,12 @@ echo "================================================================"
 echo "name       : $NAME"
 echo "neurons    : $NEURONS per layer, in $CULTURES cultures of $PER_CULTURE"
 echo "layers     : ${LAYERS:-config.layers_um}"
-echo "seed       : $SEED   cores: $CONC   bump window: $BUMP_MS ms"
+echo "seed       : $SEED   bump window: $BUMP_MS ms"
+echo "cores      : $CONC requested, $USED will do work (the split is BY CULTURE)"
+if [ "$CULTURES" -lt "$CONC" ]; then
+    echo "WARNING    : $(( CONC - CULTURES )) core(s) will sit IDLE for the whole job."
+    echo "             Raise CULTURES to $CONC, or lower ppn to $CULTURES in this file."
+fi
 echo "output     : $OUT"
 echo "================================================================"
 mkdir -p "$OUT"
