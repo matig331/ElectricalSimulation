@@ -445,11 +445,11 @@ def plot_timecourse(ax, rec, fit, phi, bump_ms, pre_ms=0.0):
     spread, mean_v, n_pre = baseline_flatness(rec, phi)
     if n_pre > 1:
         ax.axvspan(-float(pre_ms), -2.0 * phi, color=C_SHAM, alpha=0.07, lw=0, zorder=0)
-        # top-left: the bottom-left is where the stimulus callout goes when the first peak
-        # sits high, and the two collided there.
-        ax.text(0.012, 0.97, "baseline %.0f ms: Vm %.4f mV, peak-to-peak %.2e mV (%d samples)"
+        # ABOVE the axes: inside, it collided with the stimulus callout at the bottom-left
+        # when the first peak sat high and at the top-left when it sat low.
+        ax.text(0.0, 1.02, "baseline %.0f ms: Vm %.4f mV, peak-to-peak %.2e mV (%d samples)"
                 % (pre_ms, mean_v, spread, n_pre), transform=ax.transAxes, ha="left",
-                va="top", fontsize=6.8, color=C_INK, family="monospace",
+                va="bottom", fontsize=6.8, color=C_INK, family="monospace",
                 bbox=dict(boxstyle="round,pad=0.28", fc="white", ec=C_GRID, lw=0.7, alpha=0.92))
     ax.set_xlim(-float(pre_ms) - 0.01 * bump_ms, bump_ms)
     _style(ax, "", "soma Vm (mV)")
@@ -572,8 +572,9 @@ def plot_bump(ax, rec, fit, bump_ms):
         ax.plot([b["t_peak_ms"]], [b["peak_mV"]], marker="D", ms=8, mfc=C_BUMP, mec="white",
                 mew=1.4, ls="none", zorder=9)
         ax.annotate("peak %.3f mV @ %.1f ms" % (b["peak_mV"], b["t_peak_ms"]),
-                    xy=(b["t_peak_ms"], b["peak_mV"]), xytext=(16, -18),
-                    textcoords="offset points", fontsize=7, color=C_INK,
+                    xy=(b["t_peak_ms"], b["peak_mV"]), xytext=(0, -26),
+                    textcoords="offset points", fontsize=7, color=C_INK, ha="center",
+                    va="top",
                     arrowprops=dict(arrowstyle="-", color=C_INK2, lw=0.7, alpha=0.85))
     ax.set_xlim(-0.02 * bump_ms, bump_ms)
     _style(ax, "time from end of phase 2 (ms)", "bump component (mV)",
@@ -629,8 +630,7 @@ def plot_instance(rec, fit, inst, proto, figsize=(11.5, 9.0)):
 # ===========================================================================
 CSV_HEADER = (["cell_model", "morph", "layer_um", "x_um", "y_um", "r_um", "theta_deg",
                "i0_uA", "bump_ms", "fit_mode", "fired", "v_rest_mV"]
-              + list(STAGED_COLUMNS)
-              + ["bump_data_peak_mV", "bump_data_t_peak_ms"])
+              + list(STAGED_COLUMNS))
 
 
 def default_placements(cfg=None, n=6):
@@ -675,8 +675,7 @@ def _row(inst, proto, rec, fit):
     return ([inst["cell_model"], inst["morph"], int(inst["layer"]), rec["pos_xy"][0],
              rec["pos_xy"][1], round(rec["r_um"], 2), rec["theta_deg"], proto["i0_uA"],
              proto["bump_ms"], fit["mode"], rec["fired"], round(inst["v_rest"], 4)]
-            + staged_row_values(fit)
-            + [rnd(b["data_peak_mV"], 6), rnd(b["data_t_peak_ms"], 3)])
+            + staged_row_values(fit))
 
 
 def main(cell_model="full_tuned", placements=None, i0_uA=None, bump_ms=800.0,

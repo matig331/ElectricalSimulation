@@ -76,6 +76,11 @@ OUTCOME_CSV_HEADER = LEGACY_CSV_HEADER + ["cell_model", "v_rest_mV", "ctrl_drift
                                           "deltaVm_end_phase2_mV", "phase2_outcome",
                                           "depolarized", "hyperpolarized"]
 CSV_HEADER = OUTCOME_CSV_HEADER + list(STAGED_COLUMNS)
+# The first kinetics schema (44 columns): the same, without dexp_data_peak_mV and
+# dexp_data_t_peak_ms. Written only by the first full_tuned dry runs. Recognised, read-only,
+# and -- like every schema -- never merged together with another one.
+KINETICS_V1_CSV_HEADER = [c for c in CSV_HEADER
+                          if c not in ("dexp_data_peak_mV", "dexp_data_t_peak_ms")]
 OUTCOME_COLS = ("fired", "depolarized", "hyperpolarized")
 # outcome name -> (file-name stem, 0/1 column). MUST match culture_statistics.OUTCOMES
 # (checked by smoke_test_culture_statistics.py).

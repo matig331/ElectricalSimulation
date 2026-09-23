@@ -76,6 +76,17 @@ def load(path):
         raise SystemExit("%s has no kinetics columns (%s). It was written with bump_ms = 0, "
                          "or by an older version." % (path, ", ".join(missing)))
     get = lambda k: np.array([_f(r.get(k, "")) for r in rows])
+    # measured (model-free) bump peak: campaign rows carry dexp_data_peak_mV, the example-
+    # trace CSV of older versions carried bump_data_peak_mV. A CSV with neither can only show
+    # rejected fits at their FITTED peak -- which is meaningless -- and the figure says so.
+    if "dexp_data_peak_mV" in rows[0]:
+        data_peak, measured = get("dexp_data_peak_mV"), True
+    elif "bump_data_peak_mV" in rows[0]:
+        data_peak, measured = get("bump_data_peak_mV"), True
+    else:
+        data_peak, measured = get("dexp_peak_mV"), False
+        print("WARNING: %s has no measured-peak column; rejected fits are shown at their "
+              "FITTED peak, which is not a measurement. Re-run with the current code." % path)
     return dict(path=path, n=len(rows),
                 dist=get(DIST_COL), theta_pos=get("theta_pos_deg"),
                 theta_or=get("theta_orient_deg"), layer=get("layer_um"),
@@ -84,8 +95,7 @@ def load(path):
                 peak=get("dexp_peak_mV"), t_peak=get("dexp_t_peak_ms"),
                 tau_r=get("dexp_tau_rise_ms"), tau_d=get("dexp_tau_decay_ms"),
                 r2=get("dexp_r2"), ok=get("dexp_fit_ok") > 0.5,
-                data_peak=get("bump_data_peak_mV") if "bump_data_peak_mV" in rows[0]
-                else get("dexp_peak_mV"),
+                data_peak=data_peak, measured_peak=measured,
                 t_1e=get("early_t_1e_ms"), tau_m=get("early_tau_ms"),
                 early_ok=get("early_fit_ok") > 0.5)
 
@@ -233,10 +243,15 @@ def page_amplitude(d, edges, amp_thresh):
 
     fig.suptitle("Post-pulse Ih bump -- amplitude and prevalence", fontsize=11, color=C_INK,
                  x=0.055, ha="left", y=0.975)
-    fig.text(0.055, 0.915, "A rejected fit is plotted at its MEASURED DeltaV (grey x), never "
-             "at its fitted peak: with no bump to fit, the model's parameters are meaningless "
-             "and its taus sit on the search bounds.",
-             fontsize=7, color=C_INK2, ha="left", va="top")
+    if d.get("measured_peak", True):
+        sub = ("A rejected fit is plotted at its MEASURED bump peak (grey x), never at its "
+               "fitted peak: with no bump to fit, the model's parameters are meaningless and "
+               "its taus sit on the search bounds.")
+    else:
+        sub = ("WARNING: this CSV has no measured-peak column, so rejected fits (grey x) are "
+               "shown at their FITTED peak, which is NOT a measurement. Re-run the simulation "
+               "with the current code.")
+    fig.text(0.055, 0.915, sub, fontsize=7, color=C_INK2, ha="left", va="top")
     fig.tight_layout(rect=[0, 0, 1, 0.885])
     return fig
 

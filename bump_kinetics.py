@@ -622,7 +622,13 @@ EXPDECAY_COLUMNS = ("early_peak_mV", "early_t_peak_ms", "early_sign", "early_tau
                     "early_t_1e_ms", "early_amp_mV", "early_amp_over_peak",
                     "early_t_fit_hi_ms", "early_r2", "early_fit_ok")
 
+# dexp_data_peak_mV / dexp_data_t_peak_ms are the MEASURED bump peak (model-free, see
+# fit_double_exp_from_zero). They are in every row because they are the only trustworthy
+# amplitude when the fit is rejected: a rejected fit's dexp_peak_mV is the extremum of a model
+# that does not describe the trace. Found on the cluster dry run, where a rejected fit (taus
+# pinned at 0.5 / 5000 ms, r2 0.30) had dexp_peak_mV 0.086 mV and was plotted as a bump.
 DEXP_COLUMNS = ("dexp_t0_ms", "dexp_dv_t0_mV", "dexp_peak_mV", "dexp_t_peak_ms",
+                "dexp_data_peak_mV", "dexp_data_t_peak_ms",
                 "dexp_tau_rise_ms", "dexp_tau_decay_ms", "dexp_tau_offset_ms",
                 "dexp_amp_mV", "dexp_offset_mV", "dexp_sign", "dexp_r2", "dexp_fit_ok")
 
@@ -642,7 +648,9 @@ def expdecay_row_values(fit):
 def dexp_row_values(fit):
     """The DEXP_COLUMNS values of one fit_double_exp_from_zero() result, rounded for a CSV."""
     return [_rnd(fit["t0_ms"], 3), _rnd(fit["dv_t0_mV"], 6), _rnd(fit["peak_mV"], 6),
-            _rnd(fit["t_peak_ms"], 3), _rnd(fit["tau_rise_ms"], 3),
+            _rnd(fit["t_peak_ms"], 3),
+            _rnd(fit.get("data_peak_mV", float("nan")), 6),
+            _rnd(fit.get("data_t_peak_ms", float("nan")), 3), _rnd(fit["tau_rise_ms"], 3),
             _rnd(fit["tau_decay_ms"], 3), _rnd(fit["tau_offset_ms"], 3),
             _rnd(fit["amp_mV"], 6), _rnd(fit["offset_mV"], 6), fit["sign"],
             _rnd(fit["r2"], 4), int(fit["fit_ok"])]

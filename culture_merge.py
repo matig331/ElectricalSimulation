@@ -50,11 +50,12 @@ from collections import Counter
 
 import numpy as np
 
-from culture_export import (CELL_MODELS, CSV_HEADER, LEGACY_CSV_HEADER, OUTCOME_CSV_HEADER,
-                            OutcomeWriter,
+from culture_export import (CELL_MODELS, CSV_HEADER, KINETICS_V1_CSV_HEADER,
+                            LEGACY_CSV_HEADER, OUTCOME_CSV_HEADER, OutcomeWriter,
                             PLOT_COLUMNS)
 
 SCHEMAS = {tuple(CSV_HEADER): "current",
+           tuple(KINETICS_V1_CSV_HEADER): "legacy_kinetics_v1_no_measured_peak",
            tuple(OUTCOME_CSV_HEADER): "legacy_outcomes_no_kinetics",
            tuple(LEGACY_CSV_HEADER): "legacy_full_active"}
 # LEGACY_CSV_HEADER is a prefix of CSV_HEADER, so these indices hold for BOTH schemas
