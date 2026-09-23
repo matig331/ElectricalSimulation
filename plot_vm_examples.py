@@ -149,7 +149,7 @@ def build_instance(morph, layer, cell_model, cfg=None, rest_tstop_ms=1500.0, tag
 # 2. simulation -- the protocol, independent of which cell it is applied to
 # ===========================================================================
 def default_protocol(cfg=None, i0_uA=None, bump_ms=800.0, bump_dt_ms=0.5, cvode_atol=1e-6,
-                     play_margin_ms=3.0):
+                     play_margin_ms=3.0, baseline_ms=100.0, pre_ms=None):
     """The stimulation protocol as one dict, so swapping it touches nothing else.
 
     bump_ms         window integrated AFTER the end of phase 2. The bump peaks near 95 ms and
@@ -162,12 +162,27 @@ def default_protocol(cfg=None, i0_uA=None, bump_ms=800.0, bump_dt_ms=0.5, cvode_
                     sample for sample, and hence the window on which DeltaV can be formed at
                     full 0.025 ms resolution -- which is what the ~0.2 ms polarisation decay
                     needs. 3 ms costs ~120 extra fixed steps and nothing else.
+    baseline_ms     how long the cell is integrated BEFORE the stimulus. The campaign uses the
+                    rich_footprint default of 5 ms, enough to classify an outcome but showing
+                    nothing about calibration. 100 ms here puts 4000 samples of pre-stimulus
+                    trace on the figure, so a tuned cell being genuinely flat at rest is
+                    something you can SEE rather than take on trust.
+
+                    DO NOT RAISE IT BLINDLY. The extracellular field is played into ~1250
+                    segments on the full fixed-dt grid, so the play Vectors grow with the
+                    baseline: measured 0.038 s per ms of simulation, and a SEGMENTATION FAULT
+                    between 150 and 300 ms on a 7 GB machine. 100 ms costs ~4.7 s per run and
+                    is verified; 50 ms costs 2.6 s. A larger node may take more -- raise it in
+                    steps, and expect a hard crash rather than an exception if you go too far.
+    pre_ms          how much of that baseline is returned and drawn. None = all of it.
     """
     from config import CFG
     cfg = CFG if cfg is None else cfg
     phi = float(cfg.phase_dur_ms)
+    base = float(baseline_ms)
     return dict(i0_uA=(float(cfg.i0_uA) if i0_uA is None else float(i0_uA)),
-                phase_dur_ms=phi, dt_ms=float(cfg.dt_ms), pre_end_ms=2.0 * phi,
+                phase_dur_ms=phi, dt_ms=float(cfg.dt_ms), baseline_ms=base,
+                pre_end_ms=(base if pre_ms is None else float(pre_ms)),
                 bump_ms=float(bump_ms), bump_dt_ms=float(bump_dt_ms),
                 cvode_atol=float(cvode_atol), play_margin_ms=float(play_margin_ms))
 
@@ -183,6 +198,7 @@ def _run(inst, proto, pos_xy, theta_deg, i0_uA):
     nsp, vmax, tw, vw, tb, vb = spikes_at(
         inst["cell"], (float(pos_xy[0]), float(pos_xy[1])), float(theta_deg),
         i0_uA=float(i0_uA), phase_dur_ms=proto["phase_dur_ms"], dt_ms=proto["dt_ms"],
+        baseline_ms=proto["baseline_ms"],
         detail=True, pre_end_ms=proto["pre_end_ms"], v_init_mV=inst["v_rest"],
         bump_ms=proto["bump_ms"], bump_dt_ms=proto["bump_dt_ms"],
         cvode_atol=proto["cvode_atol"], play_margin_ms=proto["play_margin_ms"])
@@ -353,7 +369,22 @@ def reconstruction(rec, fit):
     return t, vm_model, rec["v_grid"] - vm_model
 
 
-def plot_timecourse(ax, rec, fit, phi, bump_ms):
+def baseline_flatness(rec, phi, guard_ms=1.0):
+    """Peak-to-peak Vm over the pre-stimulus baseline, its mean, and the sample count.
+
+    The calibration check, as a number. A cell whose leak was tuned to its own settled rest
+    should sit flat: measured 1.75e-05 mV peak-to-peak over 50 ms, 5.71e-05 over 100 ms. A
+    baseline that drifts means the cell was initialised away from its equilibrium, which is
+    exactly what tune_leak_isopotential exists to remove.
+    """
+    t, v = rec["t_fine"], rec["v_fine"]
+    m = t < -(2.0 * phi + float(guard_ms))
+    if int(m.sum()) < 2:
+        return float("nan"), float("nan"), 0
+    return float(v[m].max() - v[m].min()), float(v[m].mean()), int(m.sum())
+
+
+def plot_timecourse(ax, rec, fit, phi, bump_ms, pre_ms=0.0):
     """Top panel: the soma Vm, the stimulus, the two marked points, and the reconstruction."""
     t, v = rec["t_fine"], rec["v_fine"]
     ax.plot(rec["t_fine_sham"], rec["v_fine_sham"], color=C_SHAM, ls="--", lw=1.0, zorder=3,
@@ -411,7 +442,16 @@ def plot_timecourse(ax, rec, fit, phi, bump_ms):
                     fontsize=7, color=C_INK, va="bottom" if above else "top",
                     arrowprops=dict(arrowstyle="-", color=C_INK2, lw=0.7, alpha=0.85))
 
-    ax.set_xlim(-2.0 * phi - 0.02 * bump_ms, bump_ms)
+    spread, mean_v, n_pre = baseline_flatness(rec, phi)
+    if n_pre > 1:
+        ax.axvspan(-float(pre_ms), -2.0 * phi, color=C_SHAM, alpha=0.07, lw=0, zorder=0)
+        # top-left: the bottom-left is where the stimulus callout goes when the first peak
+        # sits high, and the two collided there.
+        ax.text(0.012, 0.97, "baseline %.0f ms: Vm %.4f mV, peak-to-peak %.2e mV (%d samples)"
+                % (pre_ms, mean_v, spread, n_pre), transform=ax.transAxes, ha="left",
+                va="top", fontsize=6.8, color=C_INK, family="monospace",
+                bbox=dict(boxstyle="round,pad=0.28", fc="white", ec=C_GRID, lw=0.7, alpha=0.92))
+    ax.set_xlim(-float(pre_ms) - 0.01 * bump_ms, bump_ms)
     _style(ax, "", "soma Vm (mV)")
     ax.tick_params(labelbottom=False)
     if clipped:
@@ -422,7 +462,7 @@ def plot_timecourse(ax, rec, fit, phi, bump_ms):
     return tm, _res
 
 
-def plot_residual(ax, t_res, res, phi, bump_ms):
+def plot_residual(ax, t_res, res, phi, bump_ms, pre_ms=0.0):
     """The strip under the timecourse: measured Vm minus the reconstruction.
 
     This is the panel that makes the fit falsifiable. A structured residual -- a slow arc, a
@@ -443,7 +483,6 @@ def plot_residual(ax, t_res, res, phi, bump_ms):
                 family="monospace",
                 bbox=dict(boxstyle="round,pad=0.25", fc="white", ec=C_GRID, lw=0.7,
                           alpha=0.92))
-    ax.set_xlim(-2.0 * phi - 0.02 * bump_ms, bump_ms)
     _style(ax, "time from end of phase 2 (ms)", "measured -\nmodel (mV)")
 
 
@@ -558,8 +597,10 @@ def plot_instance(rec, fit, inst, proto, figsize=(11.5, 9.0)):
                              left=0.075, right=0.985, top=0.855, bottom=0.095)
     top = outer[0].subgridspec(2, 1, height_ratios=[1.05, 0.30], hspace=0.08)
     ax_top = fig.add_subplot(top[0])
-    t_res, res = plot_timecourse(ax_top, rec, fit, phi, proto["bump_ms"])
-    plot_residual(fig.add_subplot(top[1], sharex=ax_top), t_res, res, phi, proto["bump_ms"])
+    pre_ms = float(proto.get("pre_end_ms", 2.0 * phi))
+    t_res, res = plot_timecourse(ax_top, rec, fit, phi, proto["bump_ms"], pre_ms)
+    plot_residual(fig.add_subplot(top[1], sharex=ax_top), t_res, res, phi, proto["bump_ms"],
+                  pre_ms)
     bot = outer[1].subgridspec(1, 2, wspace=0.22)
     note = plot_polarisation(fig.add_subplot(bot[0]), rec, fit, phi)
     plot_bump(fig.add_subplot(bot[1]), rec, fit, proto["bump_ms"])
@@ -639,7 +680,8 @@ def _row(inst, proto, rec, fit):
 
 
 def main(cell_model="full_tuned", placements=None, i0_uA=None, bump_ms=800.0,
-         bump_dt_ms=0.5, cvode_atol=1e-6, play_margin_ms=3.0, t0_ms=0.0, mode="staged",
+         bump_dt_ms=0.5, cvode_atol=1e-6, play_margin_ms=3.0, baseline_ms=100.0,
+         t0_ms=0.0, mode="staged",
          early_floor=0.25, n_instances=6, out_pdf="plot_vm_examples.pdf",
          out_csv="plot_vm_examples.csv", verbose=True):
     """Simulate every placement, fit it, and write one PDF page and one CSV row each.
@@ -650,7 +692,8 @@ def main(cell_model="full_tuned", placements=None, i0_uA=None, bump_ms=800.0,
     from config import CFG
     here = os.path.dirname(os.path.abspath(__file__))
     proto = default_protocol(CFG, i0_uA=i0_uA, bump_ms=bump_ms, bump_dt_ms=bump_dt_ms,
-                             cvode_atol=cvode_atol, play_margin_ms=play_margin_ms)
+                             cvode_atol=cvode_atol, play_margin_ms=play_margin_ms,
+                             baseline_ms=baseline_ms)
     places = default_placements(CFG, n_instances) if placements is None else list(placements)
 
     rows, cache = [], {}
@@ -706,6 +749,10 @@ def _cli(argv=None):
     ap.add_argument("--bump-ms", type=float, default=800.0,
                     help="window integrated after the pulse (default 800)")
     ap.add_argument("--bump-dt-ms", type=float, default=0.5, help="fixed output grid for fits")
+    ap.add_argument("--baseline-ms", type=float, default=100.0,
+                    help="pre-stimulus baseline drawn on the figure, to show the cell sits "
+                         "flat at rest. ~0.038 s per ms per run; SEGFAULTS between 150 and "
+                         "300 ms on a 7 GB machine -- raise in steps.")
     ap.add_argument("--play-margin-ms", type=float, default=3.0,
                     help="fixed-dt tail after the pulse; sets the exact-DeltaV window")
     ap.add_argument("--cvode-atol", type=float, default=1e-6)
@@ -722,7 +769,8 @@ def _cli(argv=None):
     return main(cell_model=a.cell_model, mode=a.mode,
                 placements=(parse_placements(a.placements) if a.placements else None),
                 i0_uA=a.i0_uA, bump_ms=a.bump_ms, bump_dt_ms=a.bump_dt_ms,
-                play_margin_ms=a.play_margin_ms, cvode_atol=a.cvode_atol, t0_ms=a.t0_ms,
+                play_margin_ms=a.play_margin_ms, baseline_ms=a.baseline_ms,
+                cvode_atol=a.cvode_atol, t0_ms=a.t0_ms,
                 early_floor=a.early_floor, n_instances=a.n_instances, out_pdf=a.out_pdf,
                 out_csv=a.out_csv)
 
