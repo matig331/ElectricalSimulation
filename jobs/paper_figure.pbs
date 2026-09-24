@@ -1,0 +1,82 @@
+#!/bin/bash
+# ---------------------------------------------------------------------------
+# PBS/Torque -- PUBLICATION FIGURE: one soma Vm trace and what is read out of it.
+#
+# Simulates ONE placement with the full model (paper_fig_readouts.py) and draws the
+# three-panel figure: A the trace (stimulated vs sham, the DeltaV between them, the fitted
+# reconstruction), B the direct polarisation (DeltaV_end, peak, tau_m, t_1/e), C the bump
+# alone read out the same way (the pinning at t0, the double exponential's two terms with
+# tau_r and tau_d, its peak DeltaV_b at t_b).
+#
+# Choose the neuron from a campaign's example pages -- rank the candidates first:
+#   python paper_fig_readouts.py suggest --from-examples-csv analysis/<dir>/campaign_examples.csv
+#
+# Submit from the pipeline folder:
+#   qsub -v FROM_EXAMPLES=analysis/<dir>/campaign_examples.csv,EXAMPLE=7 jobs/paper_figure.pbs
+#   qsub -v PLACEMENT=130303:120:-110:-110:270 jobs/paper_figure.pbs
+# Options, comma-separated:
+#   FROM_EXAMPLES=...  plot_vm_examples.csv or campaign_examples.csv   (with EXAMPLE=N)
+#   PLACEMENT=...      morph:layer:x:y:theta  (used when FROM_EXAMPLES is not given)
+#   MODEL=full_tuned   cell model
+#   BUMP_MS=800        post-pulse window drawn and fitted
+#   OUT=figures/fig_readouts   output stem -> .pdf .svg .png .npz _values.txt
+#   WIDTH_MM=180       figure width (double column); the layout scales with it
+#
+# Cost: one cell build + one sham + one stimulation, a few minutes. Redraw later without
+# NEURON, anywhere:  python paper_fig_readouts.py plot --data figures/fig_readouts.npz
+# ---------------------------------------------------------------------------
+#PBS -N estim_paper_fig
+#PBS -l nodes=1:ppn=1
+#PBS -l walltime=00:30:00
+#PBS -q cpu
+#PBS -j oe
+#PBS -o logs/estim_paper_fig.log
+
+set -euo pipefail
+
+REPO=""
+for cand in "${PBS_O_WORKDIR:-}" "${PBS_O_WORKDIR:-}/.." "$PWD" "$PWD/.." "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)"; do
+    if [ -n "$cand" ] && [ -f "$cand/paper_fig_readouts.py" ]; then
+        REPO="$(cd "$cand" && pwd)"; break
+    fi
+done
+if [ -z "$REPO" ]; then echo "FATAL: repo not found (no paper_fig_readouts.py)" >&2; exit 1; fi
+cd "$REPO"
+mkdir -p logs
+
+if [ -f jobs/env_setup.sh ]; then
+    source jobs/env_setup.sh
+else
+    echo "NOTE: jobs/env_setup.sh absent -- relying on the ambient environment"
+fi
+
+MODEL="${MODEL:-full_tuned}"
+BUMP_MS="${BUMP_MS:-800}"
+OUT="${OUT:-figures/fig_readouts}"
+WIDTH_MM="${WIDTH_MM:-180}"
+mkdir -p "$(dirname "$OUT")"
+
+if [ -n "${FROM_EXAMPLES:-}" ]; then
+    SRC=(--from-examples-csv "$FROM_EXAMPLES" --example "${EXAMPLE:-1}")
+    echo "neuron     : example ${EXAMPLE:-1} of $FROM_EXAMPLES"
+elif [ -n "${PLACEMENT:-}" ]; then
+    SRC=(--placement "$PLACEMENT")
+    echo "neuron     : $PLACEMENT"
+else
+    echo "FATAL: give FROM_EXAMPLES=...,EXAMPLE=N or PLACEMENT=morph:layer:x:y:theta" >&2
+    exit 2
+fi
+echo "model      : $MODEL   window: $BUMP_MS ms   width: $WIDTH_MM mm"
+echo "output     : $OUT.{pdf,svg,png,npz} + ${OUT}_values.txt"
+
+echo "--- offline smoke test (no NEURON) ---"
+python smoke_test_paper_fig_readouts.py 2>/dev/null | tail -1
+
+RC=0
+python paper_fig_readouts.py all "${SRC[@]}" --cell-model "$MODEL" --bump-ms "$BUMP_MS" \
+    --width-mm "$WIDTH_MM" --out-stem "$OUT" > "${OUT}.log" 2>&1 || RC=$?
+grep -v "lines read\|problems\|Main branch\|logical connection\|^$" "${OUT}.log" || true
+if [ "$RC" != "0" ]; then echo "FAILED (exit $RC) -- full log: ${OUT}.log" >&2; exit "$RC"; fi
+echo "---------------------------------------------------------------"
+cat "${OUT}_values.txt"
+echo "done: $OUT.pdf"

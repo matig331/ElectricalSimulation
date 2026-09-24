@@ -7,12 +7,24 @@
 # polarisation and the double exponential for the bump, pinned to zero at the end of the
 # pulse. See plot_vm_examples.py for the model and why the pinning matters.
 #
-# This runs NEW simulations (it does not read the campaign CSVs), but only a handful: one
-# cell build per (morphology, layer) plus one sham and one stimulation per placement. Single
-# process, so ppn=2 is enough -- the second core is only numpy headroom.
+# TWO MODES
+#   hand-picked (default)  a few built-in placements, one process; ppn=2 is enough.
+#   FROM_CSV=<campaign>    neurons a campaign ACTUALLY simulated: rows are chosen from its CSV,
+#                          their placements regenerated from (seed, culture) and checked, then
+#                          re-simulated and drawn -- a gallery page of all of them, then one
+#                          detailed page each, each cross-checked against its row. Runs in
+#                          parallel over (morphology, layer), so ask for cores:
+#                              qsub -l nodes=1:ppn=8 -v FROM_CSV=...,BUMP_MS=... jobs/vm_examples.pbs
 #
 # Submit from the pipeline folder:   qsub jobs/vm_examples.pbs
 # Options, comma-separated:          qsub -v MODEL=soma_only,N=3 jobs/vm_examples.pbs
+#   FROM_CSV=...     campaign CSV, results dir, or parts dir (part_*.csv, also mid-run)
+#   N_EXAMPLES=24    with FROM_CSV: how many rows
+#   SELECT=...       with FROM_CSV: stratified (default) | accepted | rejected | nearest | random
+#   PER_CULTURE=...  with FROM_CSV: neurons per culture of that campaign; only needed if the
+#                    walltime cut EVERY culture short (otherwise inferred from the rows)
+#   BUMP_MS          with FROM_CSV it MUST be the window the campaign ran with (the rows do
+#                    not record it; a wrong one shows up as "DIFFERS" on every page)
 #   MODEL=...        full_tuned (default) | full_active | soma_only
 #                    soma_only is the NEGATIVE control: Ih is dendritic, so it has no bump
 #   N=...            how many of the built-in default placements (default 6)
@@ -56,9 +68,12 @@ fi
 MODEL="${MODEL:-full_tuned}"
 BUMP_MS="${BUMP_MS:-800}"
 FIT="${FIT:-staged}"
+EARLY_FLOOR_SET="${EARLY_FLOOR:-}"
 EARLY_FLOOR="${EARLY_FLOOR:-0.25}"
+N_EXAMPLES_MSG="${N_EXAMPLES:-24} examples, ${SELECT:-stratified}"
 N="${N:-6}"
 OUT="${OUT:-analysis/vm_examples_${MODEL}_$(date +%Y%m%d_%H%M)}"
+FROM_CSV="${FROM_CSV:-}"
 mkdir -p "$OUT"
 
 # --- the delivery this script depends on must actually be in place ---------
@@ -105,6 +120,7 @@ PY
 if [ "${SMOKE:-1}" != "0" ]; then
     echo "--- offline smoke test (no NEURON, instant) ---"
     python smoke_test_bump_kinetics.py | tail -1
+    if [ -n "$FROM_CSV" ]; then python smoke_test_campaign_examples.py 2>/dev/null | tail -1; fi
 fi
 
 echo "model      : $MODEL"
@@ -112,14 +128,33 @@ echo "bump window: $BUMP_MS ms   fit: $FIT   early floor: $EARLY_FLOOR"
 echo "output     : $OUT"
 echo "---------------------------------------------------------------"
 
-ARGS=(--cell-model "$MODEL" --bump-ms "$BUMP_MS" --fit "$FIT"
-      --early-floor "$EARLY_FLOOR"
-      --out-pdf "$OUT/plot_vm_examples.pdf" --out-csv "$OUT/plot_vm_examples.csv")
-if [ -n "${PLACEMENTS:-}" ]; then ARGS+=(--placements "$PLACEMENTS"); else ARGS+=(--n-instances "$N"); fi
-if [ -n "${I0:-}" ]; then ARGS+=(--i0-uA "$I0"); fi
+if [ -n "$FROM_CSV" ]; then
+    # the campaign's own early floor (config.bump_early_floor) is used unless EARLY_FLOOR is
+    # set explicitly; the amplitude comes from the rows
+    echo "from       : $FROM_CSV   ($N_EXAMPLES_MSG)"
+    echo "NOTE       : BUMP_MS=$BUMP_MS must be the window that campaign ran with"
+    ARGS=(--cell-model "$MODEL" --bump-ms "$BUMP_MS" --from-csv "$FROM_CSV"
+          --n-examples "${N_EXAMPLES:-24}" --select "${SELECT:-stratified}"
+          --processes "${PBS_NUM_PPN:-${PBS_NP:-$(nproc)}}"
+          --out-pdf "$OUT/campaign_examples.pdf" --out-csv "$OUT/campaign_examples.csv")
+    if [ -n "${EARLY_FLOOR_SET:-}" ]; then ARGS+=(--early-floor "$EARLY_FLOOR"); fi
+    if [ -n "${PER_CULTURE:-}" ]; then ARGS+=(--neurons-per-culture "$PER_CULTURE"); fi
+    RESULT="$OUT/campaign_examples.pdf"
+else
+    ARGS=(--cell-model "$MODEL" --bump-ms "$BUMP_MS" --fit "$FIT"
+          --early-floor "$EARLY_FLOOR"
+          --out-pdf "$OUT/plot_vm_examples.pdf" --out-csv "$OUT/plot_vm_examples.csv")
+    if [ -n "${PLACEMENTS:-}" ]; then ARGS+=(--placements "$PLACEMENTS"); else ARGS+=(--n-instances "$N"); fi
+    if [ -n "${I0:-}" ]; then ARGS+=(--i0-uA "$I0"); fi
+    RESULT="$OUT/plot_vm_examples.pdf"
+fi
 
-time python plot_vm_examples.py "${ARGS[@]}"
+# full output to a log next to the PDF; NEURON's morphology chatter filtered from the echo
+RC=0
+time python plot_vm_examples.py "${ARGS[@]}" > "$OUT/run.log" 2>&1 || RC=$?
+grep -v "lines read\|problems\|Main branch\|logical connection\|^$" "$OUT/run.log" || true
+if [ "$RC" != "0" ]; then echo "FAILED (exit $RC) -- full log: $OUT/run.log" >&2; exit "$RC"; fi
 
 echo "---------------------------------------------------------------"
 ls -la "$OUT"
-echo "done: $OUT/plot_vm_examples.pdf"
+echo "done: $RESULT"

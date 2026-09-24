@@ -6,7 +6,9 @@
 #   1) fan culture_worker.py across the cores (jobs/run_parallel.sh) and merge this job's parts
 #   2) outcome statistics + P maps          -> <OUT>/stats, <OUT>/maps      (culture_statistics)
 #   3) post-pulse Ih bump statistics        -> <OUT>/bump_statistics.pdf    (plot_bump_statistics)
-#   4) a handful of example Vm traces       -> <OUT>/plot_vm_examples.pdf   (plot_vm_examples)
+#   4) example traces OF THIS RUN'S NEURONS -> <OUT>/campaign_examples.pdf  (plot_vm_examples
+#      --from-csv): N_EXAMPLES rows re-simulated and drawn with their fits -- a gallery page
+#      of all of them, then one detailed page each, cross-checked against the row
 #
 #   qsub jobs/full_tuned_run.pbs                       # 1000 neurons/layer, 10 cultures
 #   qsub -v NEURONS=2000,CULTURES=20 jobs/full_tuned_run.pbs
@@ -28,6 +30,10 @@
 #   NAME=            tag for the parts dir and the outputs; default ft<NEURONS>_<date>.
 #   OUT=             output folder; default analysis/<NAME>.
 #   SKIP_EXAMPLES=1  skip step 4.
+#   N_EXAMPLES=24    how many of the run's neurons step 4 draws.
+#   SELECT=stratified  which ones: stratified (accepted fits across the distance range + the
+#                    rejected fits with the largest measured bump) | accepted | rejected |
+#                    nearest | random
 #
 # SIZING -- read this before raising NEURONS.
 # Measured on a cluster node, 1852-segment morphology: 0.995 s per simulation with the short
@@ -143,11 +149,26 @@ if [ "$BUMP_MS" != "0" ]; then
         --out-pdf "$OUT/bump_statistics.pdf" --out-csv "$OUT/bump_statistics.csv"
 fi
 
-# --- 4. a few example traces ----------------------------------------------
+# --- 4. example traces of neurons THIS RUN simulated ------------------------
+# The rows hold numbers, not traces, so the chosen rows are re-simulated (placement regenerated
+# from seed/culture and checked against the row) with the same window, and every page says
+# whether the re-simulation reproduces the row. Parallel over (morphology, layer) groups.
 if [ "${SKIP_EXAMPLES:-0}" != "1" ] && [ "$BUMP_MS" != "0" ]; then
-    echo "--- example Vm traces --------------------------------------------"
+    echo "--- example traces from this run ---------------------------------"
+    # full output to a log, NEURON's morphology chatter filtered from what is echoed here.
+    # A failure here must not look like a failed run: steps 1-3 are already on disk.
+    EX_RC=0
     python plot_vm_examples.py --cell-model full_tuned --bump-ms "$BUMP_MS" \
-        --out-pdf "$OUT/plot_vm_examples.pdf" --out-csv "$OUT/plot_vm_examples.csv"
+        --from-csv "$ACT" --n-examples "${N_EXAMPLES:-24}" --select "${SELECT:-stratified}" \
+        --neurons-per-culture "$PER_CULTURE" --processes "$CONC" \
+        --out-pdf "$OUT/campaign_examples.pdf" --out-csv "$OUT/campaign_examples.csv" \
+        > "$OUT/campaign_examples.log" 2>&1 || EX_RC=$?
+    grep -v "lines read\|problems\|Main branch\|logical connection\|^$" \
+        "$OUT/campaign_examples.log" || true
+    if [ "$EX_RC" != "0" ]; then
+        echo "WARNING: step 4 failed (exit $EX_RC) -- steps 1-3 are complete. Full log:"
+        echo "         $OUT/campaign_examples.log ; rerun step 4 alone with jobs/vm_examples.pbs"
+    fi
 fi
 
 echo "================================================================"

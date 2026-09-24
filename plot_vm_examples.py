@@ -55,16 +55,33 @@ DeltaV(t) = Vm_stim(t) - Vm_sham(t) with t = 0 at the END of phase 2 -- the same
 sham-referenced quantity the export classifies, so these pages are directly comparable with
 culture_Pdepolarization / culture_Phyperpolarization / culture_Pkinetics.
 
+NEURONS FROM A CAMPAIGN (--from-csv, section 6)
+The default placements are hand-picked. --from-csv instead draws neurons a campaign actually
+simulated: rows are chosen from its CSV (default: accepted fits spread over distance, plus the
+rejected fits with the largest measured bump), each placement is REGENERATED from
+(seed, culture) and checked against the row, then re-simulated with the campaign's protocol
+and fitted with the same fit_staged. Output: a gallery page of all of them (DeltaV with the
+reconstruction over it), then one page like the ones above per neuron, each saying whether the
+re-simulation reproduces the row. Measured in the sandbox: DeltaV_end equal to the row's
+1e-6 mV rounding, bump peak to ~1e-4 mV, tau_decay to the rounding. Parallel over
+(morphology, layer) groups (spawned processes).
+
 Run:
     python plot_vm_examples.py                              # full_tuned, 6 instances
     python plot_vm_examples.py --cell-model soma_only       # expect NO bump: Ih is dendritic
     python plot_vm_examples.py --placements "60308:80:90:-30:0,130303:80:-150:40:90"
     python plot_vm_examples.py --fit joint --help
+    python plot_vm_examples.py --from-csv results_full_tuned/<run>/culture_Pactivation.csv \
+        --bump-ms <the campaign's window> --n-examples 24 --processes 8
 
-Outputs (next to this file): plot_vm_examples.pdf, one page per instance, and
-plot_vm_examples.csv, one row per instance with every fitted parameter.
+Outputs (next to this file unless a path is given): plot_vm_examples.pdf, one page per
+instance, and plot_vm_examples.csv, one row per instance with every fitted parameter;
+with --from-csv, campaign_examples.pdf / .csv (the CSV also holds the row's own numbers and
+the re-simulation difference).
 
-Test:  python smoke_test_plot_vm_examples.py
+Test:  python smoke_test_plot_vm_examples.py        (NEURON, a few minutes)
+       python smoke_test_campaign_examples.py       (no NEURON, seconds: row choice, placement
+                                                     recovery, cross-check, gallery)
 """
 import argparse
 import csv
@@ -119,7 +136,7 @@ def build_instance(morph, layer, cell_model, cfg=None, rest_tstop_ms=1500.0, tag
     from config import CFG
     from morphologies import find_one_morphology
     from slicer import reduced_asc
-    from rich_cell import build_rich_cell, settled_resting_voltage, tune_leak_isopotential
+    from rich_cell import build_rich_cell, settled_resting_voltage
     cfg = CFG if cfg is None else cfg
     if cell_model not in PLOT_CELL_MODELS:
         raise ValueError("cell_model must be one of %s, got %r" % (PLOT_CELL_MODELS, cell_model))
@@ -138,9 +155,12 @@ def build_instance(morph, layer, cell_model, cfg=None, rest_tstop_ms=1500.0, tag
         v_rest = float(cfg.v_rest_mV)               # legacy init, matches the existing dataset
     else:
         v_rest = float(settled_resting_voltage(cell, tstop_ms=rest_tstop_ms, dt_ms=cfg.dt_ms))
-        if cell_model == "full_tuned":
-            # impose that measured rest everywhere by countering the other channels with e_pas
-            report = tune_leak_isopotential(cell, v_rest, celsius=37.0)
+        # full_tuned: impose that measured rest everywhere by countering the other channels
+        # with e_pas. Through culture_export.apply_model_state -- the function the campaign
+        # uses -- so an example is tuned exactly as a campaign neuron is (same celsius, same
+        # config.leak_tuning switch), not by a look-alike copy here.
+        from culture_export import apply_model_state
+        report = apply_model_state(cell, cell_model, cfg, v_rest)
     return dict(cell=cell, morph=str(morph), layer=float(layer), cell_model=str(cell_model),
                 v_rest=v_rest, leak_report=report)
 
@@ -527,6 +547,7 @@ def plot_polarisation(ax, rec, fit, phi):
                 mew=1.4, ls="none", zorder=9, label="DeltaV(t0), pinned to 0 in the bump fit")
     ax.set_xlim(-2.0 * phi - 0.02 * t_hi, t_hi)
     vis = [dv[m]] + ([pol[inw]] if inw.any() else [])     # the extrapolation must not set ylim
+    vis = [a for a in vis if np.isfinite(a).any()]         # a rejected fit's curve is all nan
     lo = float(min(np.nanmin(a) for a in vis))
     hi = float(max(np.nanmax(a) for a in vis))
     pad = 0.12 * (hi - lo + 1e-9)
@@ -587,7 +608,7 @@ def plot_bump(ax, rec, fit, bump_ms):
     ax.legend(fontsize=6.6, loc="lower right", frameon=True, framealpha=0.92, edgecolor=C_GRID)
 
 
-def plot_instance(rec, fit, inst, proto, figsize=(11.5, 9.0)):
+def plot_instance(rec, fit, inst, proto, figsize=(11.5, 9.0), note_line=""):
     """One finished page. Runs no simulation and no fitting -- pass it finished arrays."""
     phi = float(proto["phase_dur_ms"])
     fig = plt.figure(figsize=figsize)
@@ -619,6 +640,8 @@ def plot_instance(rec, fit, inst, proto, figsize=(11.5, 9.0)):
            "leaves behind is carried by a separate\nresidual term, whose amplitude should "
            "come out equal to -DeltaV(t0) (both printed, lower right)."
            % (inst["v_rest"], fit["mode"]))
+    if note_line:
+        sub += "\n" + note_line
     fig.suptitle(head, fontsize=10.5, color=C_INK, x=0.065, ha="left", y=0.978)
     fig.text(0.065, 0.945, sub, fontsize=7.2, color=C_INK2, ha="left", va="top",
              linespacing=1.45)
@@ -670,8 +693,6 @@ def parse_placements(text):
 
 
 def _row(inst, proto, rec, fit):
-    b = fit["bump"]
-    rnd = lambda v, n: (round(float(v), n) if np.isfinite(v) else "")
     return ([inst["cell_model"], inst["morph"], int(inst["layer"]), rec["pos_xy"][0],
              rec["pos_xy"][1], round(rec["r_um"], 2), rec["theta_deg"], proto["i0_uA"],
              proto["bump_ms"], fit["mode"], rec["fired"], round(inst["v_rest"], 4)]
@@ -733,6 +754,487 @@ def main(cell_model="full_tuned", placements=None, i0_uA=None, bump_ms=800.0,
     return pdf_path, csv_path
 
 
+# ===========================================================================
+# 6. examples FROM A CAMPAIGN: re-simulate rows of a results CSV and show their fits
+#
+# The campaign stores the fitted numbers of every neuron, not its trace (a trace per neuron
+# would be ~2 MB each). To SEE the reconstruction for neurons the campaign actually ran, the
+# rows are re-simulated here with the long window and fitted by the same fit_staged.
+#
+# A row does not store the neuron's raw rotation -- theta_orient_deg is folded to [0, 90] and
+# cannot be inverted -- but it does not need to: placements are drawn deterministically from
+# (seed, culture) by culture_export.culture_draws, so the exact placement is REGENERATED and
+# then CHECKED against the row (morphology, x, y to 0.006 um, folded orientation to 0.06 deg).
+# The regenerated position is the one simulated, not the row's rounded x/y.
+# A row that fails the check is skipped and reported, never silently re-placed. Verified on
+# the cluster dry run: 48 of 48 rows regenerated exactly.
+#
+# The re-simulation also checks the campaign: its DeltaV_end and fitted bump are compared with
+# the numbers the row recorded, and the difference is printed and written to the CSV.
+# ===========================================================================
+SELECT_MODES = ("stratified", "accepted", "rejected", "nearest", "random")
+
+
+def _ff(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def row_fit_state(row):
+    """'accepted' | 'rejected' | 'unmeasured' for one campaign row.
+
+    An unmeasured row (bump window off, or its culture outside config.bump_culture_fraction)
+    is written with dexp_fit_ok = 0 like a rejected one; what tells them apart is
+    dexp_dv_t0_mV, which every measured row has -- DeltaV at t0 exists whether or not the
+    bump fit is accepted.
+    """
+    if str(row.get("dexp_fit_ok", "")).strip() in ("1", "1.0"):
+        return "accepted"
+    if str(row.get("dexp_dv_t0_mV", "")).strip() == "":
+        return "unmeasured"
+    return "rejected"
+
+
+def load_campaign_rows(path):
+    """(source, rows) of a campaign: a CSV file, a results directory holding
+    culture_Pactivation.csv (any of the three per-outcome files carries the same placements
+    and kinetics), or a PARTS directory of raw worker files part_*.csv -- usable while a run
+    is still going, since every block is fsync'ed."""
+    import glob
+    files = [path]
+    if os.path.isdir(path):
+        cands = sorted(glob.glob(os.path.join(path, "*Pactivation*.csv"))) or \
+            sorted(glob.glob(os.path.join(path, "**", "*Pactivation*.csv"), recursive=True))
+        files = cands[:1] or sorted(glob.glob(os.path.join(path, "part_*.csv")))
+        if not files:
+            raise SystemExit("no *Pactivation*.csv and no part_*.csv under %s" % path)
+        path = files[0] if len(files) == 1 else "%s (%d part files)" % (path, len(files))
+    rows = []
+    for f in files:
+        with open(f, newline="") as fh:
+            rows.extend(csv.DictReader(fh))
+    need = ("seed", "culture", "neuron", "morphology", "layer_um", "x_um", "y_um",
+            "theta_orient_deg", "dist_dipole3d_um")
+    missing = [c for c in need if c not in (rows[0] if rows else {})]
+    if missing:
+        raise SystemExit("%s lacks %s -- not a campaign row file" % (path, ", ".join(missing)))
+    return path, rows
+
+
+def draw_context(cfg):
+    """Exactly the geometry the campaign drivers pass to culture_draws (culture_worker.py)."""
+    import field as F
+    from culture_export import electrode_center, dipole_axis_deg, dipole_frame
+    elec, sign = F.default_array(pitch_um=cfg.pitch_um, monopolar=not cfg.bipolar)
+    dip_c, dip_d = dipole_frame(elec, sign)
+    return dict(span=cfg.span_half_um(), elec=elec, center=electrode_center(elec),
+                axis=dipole_axis_deg(elec, sign), dip_c=dip_c, dip_d=dip_d,
+                morphs=list(cfg.morphologies), h_soma=cfg.h_soma_um)
+
+
+def recover_placements(rows, cfg, n_per_culture=None):
+    """(placements, skipped). Each placement is a dict(morph, layer, x, y, theta, row).
+
+    Neurons per culture (N) is not stored in a row, and the draws depend on it (positions are
+    drawn as one N x 2 block). Pass it when known -- full_tuned_run.pbs knows it as
+    PER_CULTURE. Otherwise it is inferred as max(neuron) + 1 over each seed, which is right as
+    long as ONE culture of that seed finished; if the walltime cut EVERY culture short, the
+    inferred N is too small, the check below fails for every row, and the rows are skipped
+    (never mis-placed) -- the message then says to pass --neurons-per-culture.
+    """
+    from collections import defaultdict
+    from culture_export import culture_draws
+    ctx = draw_context(cfg)
+    n_of = defaultdict(int)
+    for r in rows:
+        n_of[r["seed"]] = max(n_of[r["seed"]], int(float(r["neuron"])) + 1)
+    if n_per_culture:
+        for k in n_of:
+            n_of[k] = max(n_of[k], int(n_per_culture))
+    cache, out, skipped = {}, [], []
+    for r in rows:
+        seed, i = int(float(r["seed"])), int(float(r["neuron"]))
+        hit = None
+        # 'culture' is the draw index in raw parts; culture_statistics' merged file keeps it as
+        # 'local_culture' when it renumbers. Try both, keep whichever the row agrees with.
+        for key in ("culture", "local_culture"):
+            if key not in r or r[key] in ("", None):
+                continue
+            c = int(float(r[key]))
+            k = (seed, c)
+            if k not in cache:
+                cache[k] = culture_draws(seed, c, n_of[r["seed"]], len(ctx["morphs"]),
+                                         ctx["span"], ctx["elec"], ctx["center"],
+                                         ctx["dip_c"], ctx["dip_d"], ctx["axis"],
+                                         ctx["h_soma"])
+            d = cache[k]
+            if i >= len(d["midx"]):
+                continue
+            ok = (ctx["morphs"][int(d["midx"][i])] == r["morphology"]
+                  and abs(float(d["pos"][i, 0]) - _ff(r["x_um"])) < 0.006
+                  and abs(float(d["pos"][i, 1]) - _ff(r["y_um"])) < 0.006
+                  and abs(float(d["th_or"][i]) - _ff(r["theta_orient_deg"])) < 0.06)
+            if ok:
+                # the EXACT draw, not the row's x/y: those are rounded to 0.01 um, and on a
+                # soma ~100 um from the array that rounding alone moved DeltaV_end by 0.07 %
+                hit = (float(d["pos"][i, 0]), float(d["pos"][i, 1]), float(d["theta"][i]))
+                break
+        if hit is None:
+            skipped.append(r)
+        else:
+            out.append(dict(morph=r["morphology"], layer=_ff(r["layer_um"]),
+                            x=hit[0], y=hit[1], theta=hit[2], row=r))
+    return out, skipped
+
+
+def select_examples(placements, n, mode="stratified", seed=0):
+    """Choose `n` placements to plot, returned sorted by distance.
+
+      stratified  ~60 % ACCEPTED fits spread evenly over the distance range (the middle row of
+                  each of n equal-count distance chunks), ~40 % REJECTED fits with the largest
+                  measured |bump| -- the failures worth looking at, where a bump may exist
+                  but the fit said no. Rejected fits far from the array are flat and teach
+                  nothing, which is why they are not stratified by distance.
+      accepted    accepted fits only, stratified by distance
+      rejected    rejected fits only, largest measured |bump| first
+      nearest     the n placements closest to the array
+      random      uniform, seeded
+
+    Rows the campaign did not measure (row_fit_state 'unmeasured') are in neither the accepted
+    nor the rejected pool; if NO row was measured, stratified/accepted fall back to spreading
+    over every row by distance.
+    """
+    if mode not in SELECT_MODES:
+        raise ValueError("select must be one of %s" % (SELECT_MODES,))
+    n = int(n)
+    dist = lambda p: _ff(p["row"]["dist_dipole3d_um"])
+
+    def measured(p):
+        r = p["row"]
+        v = _ff(r.get("dexp_data_peak_mV", ""))
+        return abs(v) if np.isfinite(v) else abs(_ff(r.get("deltaVm_end_phase2_mV", "")))
+
+    ok = [p for p in placements if row_fit_state(p["row"]) == "accepted"]
+    rej = [p for p in placements if row_fit_state(p["row"]) == "rejected"]
+    if not ok and not rej and mode in ("stratified", "accepted"):
+        ok = list(placements)                     # nothing measured: spread over everything
+
+    def spread(pool, k):
+        pool = sorted(pool, key=dist)
+        if k <= 0 or not pool:
+            return []
+        if k >= len(pool):
+            return pool
+        return [ch[len(ch) // 2] for ch in np.array_split(np.array(pool, dtype=object), k)]
+
+    def worst(pool, k):
+        return sorted(pool, key=measured, reverse=True)[:max(0, k)]
+
+    if mode == "accepted":
+        pick = spread(ok, n)
+    elif mode == "rejected":
+        pick = worst(rej, n)
+    elif mode == "nearest":
+        pick = sorted(placements, key=dist)[:n]
+    elif mode == "random":
+        rng = np.random.default_rng(int(seed))
+        idx = rng.permutation(len(placements))[:n]
+        pick = [placements[i] for i in idx]
+    else:
+        n_rej = min(len(rej), int(round(0.4 * n)))
+        n_ok = min(len(ok), n - n_rej)
+        n_rej = min(len(rej), n - n_ok)              # top up with rejected if accepted ran out
+        pick = spread(ok, n_ok) + worst(rej, n_rej)
+    return sorted(list(pick), key=dist)
+
+
+def _sim_group(task):
+    """Worker (SPAWNED process): one (morphology, layer) cell, its sham, all its placements.
+
+    Returns only picklable arrays and numbers -- never the cell -- so the parent can plot.
+    """
+    morph, layer, cell_model, proto, items = task
+    from config import CFG
+    inst = build_instance(morph, layer, cell_model, cfg=CFG, tag="_pvc_")
+    sham = sham_reference(inst, proto)
+    out = [(key, simulate_instance(inst, proto, sham, (x, y), th)) for key, x, y, th in items]
+    meta = {k: inst[k] for k in ("morph", "layer", "cell_model", "v_rest")}
+    return meta, out
+
+
+def simulate_groups(places, cell_model, proto, processes=1, verbose=True):
+    """Simulate placements grouped by (morphology, layer), in parallel over groups.
+
+    `places` is a list of (key, morph, layer, x, y, theta). Returns {key: (meta, rec)}.
+    Uses the SPAWN start method: a forked child would inherit the parent's NEURON state, and
+    NEURON is not fork-safe. The parent never imports NEURON itself. A spawned child
+    re-imports the calling script, so a script that calls this (or main_from_csv) must do so
+    under `if __name__ == "__main__":` -- this module's own CLI does.
+    """
+    groups = {}
+    for key, morph, layer, x, y, th in places:
+        groups.setdefault((str(morph), float(layer)), []).append((key, x, y, th))
+    tasks = [(m, l, cell_model, proto, items) for (m, l), items in sorted(groups.items())]
+    processes = max(1, min(int(processes), len(tasks)))
+    if verbose:
+        print("[examples] %d placements in %d (morphology, layer) groups on %d process(es)"
+              % (len(places), len(tasks), processes), flush=True)
+    results = {}
+    if processes == 1:
+        it = map(_sim_group, tasks)
+    else:
+        import multiprocessing as mp
+        pool = mp.get_context("spawn").Pool(processes)
+        it = pool.imap_unordered(_sim_group, tasks, chunksize=1)
+    try:
+        for meta, out in it:
+            for key, rec in out:
+                results[key] = (meta, rec)
+            if verbose:
+                print("[examples] %s L%d done (%d placements)"
+                      % (meta["morph"], int(meta["layer"]), len(out)), flush=True)
+    except BaseException:
+        if processes > 1:
+            pool.terminate()        # don't wait for the other groups to finish a failed run
+        raise
+    if processes > 1:
+        pool.close()
+        pool.join()
+    return results
+
+
+def campaign_check(rec, fit, row):
+    """Re-simulation vs the numbers the campaign row recorded.
+
+    Measured in the sandbox (16-row full_tuned campaign, 8 re-simulated): DeltaV_end equal to
+    the row's 1e-6 mV rounding on every example, and the 100 ms baseline here vs the
+    campaign's 5 ms changes it by nothing at that precision. The bump numbers agree to ~1e-4
+    mV / ~0.1 %; the tolerances below (1e-3 mV; 3 % peak, 5 % tau_decay) therefore catch a
+    wrong neuron or a wrong window, not floating-point noise.
+    """
+    t, dv = rec["t_dv_fine"], rec["dv_fine"]
+    dv_end = float(dv[int(np.argmin(np.abs(t)))]) if t.size else float("nan")
+    row_dv = _ff(row.get("deltaVm_end_phase2_mV"))
+    b = fit["bump"]
+    state = row_fit_state(row)
+    out = dict(dv_end_resim=dv_end, dv_end_row=row_dv, d_dv_end=abs(dv_end - row_dv),
+               row_state=state, ok_resim=int(b["fit_ok"]), ok_row=int(state == "accepted"),
+               peak_resim=b["peak_mV"], peak_row=_ff(row.get("dexp_peak_mV")),
+               tau_d_resim=b["tau_decay_ms"], tau_d_row=_ff(row.get("dexp_tau_decay_ms")))
+    agree = bool(out["d_dv_end"] < 1e-3)            # False for a nan difference as well
+    if state != "unmeasured":
+        # an unmeasured row has no fit to compare -- only DeltaV_end is checked for it
+        agree = agree and out["ok_resim"] == out["ok_row"]
+        if out["ok_resim"] and out["ok_row"]:
+            agree = agree and abs(out["peak_resim"] - out["peak_row"]) < max(
+                0.005, 0.03 * abs(out["peak_row"]))
+            agree = agree and abs(out["tau_d_resim"] - out["tau_d_row"]) < \
+                0.05 * out["tau_d_row"]
+    out["agrees"] = int(agree)
+    return out
+
+
+def plot_gallery(items, proto, per_page=12, title=""):
+    """Overview pages: one small DeltaV tile per example, with the reconstruction over it.
+
+    DeltaV, not Vm, because each morphology rests at its own potential and DeltaV is the
+    quantity every fit and statistic uses. The y range comes from t >= 3 ms, so the direct
+    response -- up to ~7 mV and gone in a millisecond -- does not flatten the bump; the full
+    transient is on each example's own detailed page.
+    """
+    figs = []
+    ncol = 4
+    for p0 in range(0, len(items), per_page):
+        chunk = items[p0:p0 + per_page]
+        nrow = int(np.ceil(len(chunk) / float(ncol)))
+        fig, axes = plt.subplots(nrow, ncol, figsize=(11.5, 2.75 * nrow + 0.9), squeeze=False)
+        for ax in axes.flat[len(chunk):]:
+            ax.axis("off")
+        for ax, it in zip(axes.flat, chunk):
+            rec, fit, row, chk = it["rec"], it["fit"], it["row"], it["check"]
+            b = fit["bump"]
+            t, dv = rec["t_grid"], rec["dv"]
+            model = fit["model_grid"]
+            ok = bool(b["fit_ok"])
+            ax.axhline(0.0, color=C_INK2, lw=0.6, ls=":", zorder=1)
+            ax.plot(t, dv, color=C_DATA if ok else C_SHAM, lw=1.1, zorder=3)
+            fin = np.isfinite(model)
+            ax.plot(t[fin], model[fin], color=C_MODEL, lw=1.3 if ok else 0.9,
+                    ls="--", zorder=4, alpha=1.0 if ok else 0.6)
+            late = t >= 3.0
+            vals = np.concatenate([dv[late], model[late & fin]]) if late.any() else dv
+            vals = vals[np.isfinite(vals)]
+            if vals.size:
+                lo, hi = float(vals.min()), float(vals.max())
+                pad = 0.12 * (hi - lo) + 1e-4
+                ax.set_ylim(lo - pad, hi + pad)
+            ax.set_xlim(-0.02 * proto["bump_ms"], proto["bump_ms"])
+            ax.grid(True, color=C_GRID, lw=0.4)
+            for sd in ("top", "right"):
+                ax.spines[sd].set_visible(False)
+            ax.tick_params(labelsize=6, colors=C_INK2, length=2)
+            # the measured bump peak (model-free), as the diamond on the detailed pages
+            tp, vp = b.get("data_t_peak_ms", np.nan), b.get("data_peak_mV", np.nan)
+            if np.isfinite(tp) and np.isfinite(vp):
+                ax.plot([tp], [vp], marker="D", ms=4.5, mfc=C_BUMP, mec="white", mew=0.8,
+                        ls="none", zorder=6)
+            # numbers in the title, not in a box: a box lands on the curve somewhere on every
+            # layout, since accepted bumps peak mid-window and rejected traces fill it flat
+            if ok:
+                stats = ("peak %+.3f mV @ %.0f ms   r2 %.4f\ntau_rise %.1f ms   tau_decay %.0f ms"
+                         % (b["peak_mV"], b["t_peak_ms"], b["r2"], b["tau_rise_ms"],
+                            b["tau_decay_ms"]))
+            else:
+                stats = ("REJECTED   r2 %.3f\nmeasured peak %+.4f mV"
+                         % (b["r2"], b.get("data_peak_mV", float("nan"))))
+            ax.set_title("#%d  %s L%d  d = %.0f um%s\n%s"
+                         % (it["idx"], it["morph"], int(it["layer"]),
+                            _ff(row["dist_dipole3d_um"]), "" if chk["agrees"] else "  (!)",
+                            stats),
+                         fontsize=6.6, color=C_INK, loc="left", pad=3, linespacing=1.3)
+        fig.suptitle("%s  --  DeltaV (solid) and the reconstruction (dashed); blue = fit "
+                     "accepted, grey = rejected; diamond = measured bump peak;\n(!) = the "
+                     "re-simulation differs from the campaign row. Page %d of %d; each example "
+                     "has its own page after these."
+                     % (title, p0 // per_page + 1, int(np.ceil(len(items) / float(per_page)))),
+                     fontsize=8.0, color=C_INK, x=0.01, ha="left", y=0.995)
+        fig.text(0.01, 0.005, "y range from t >= 3 ms: the direct response is clipped here and "
+                 "shown in full on each example's own page. x: ms from the end of phase 2.",
+                 fontsize=6.5, color=C_INK2, ha="left", va="bottom")
+        fig.tight_layout(rect=[0, 0.02, 1, 1.0 - 0.40 / (2.75 * nrow + 0.9)], h_pad=1.2)
+        figs.append(fig)
+    return figs
+
+
+EXAMPLE_CSV_HEADER = (["example", "seed", "culture", "neuron"] + list(CSV_HEADER)
+                      + ["dist_dipole3d_um", "row_fit_state", "row_peak_mV", "row_tau_decay_ms",
+                         "row_dv_end_mV", "resim_dv_end_mV", "abs_diff_dv_end_mV",
+                         "agrees_with_row"])
+
+
+def campaign_protocol(cfg, rows, bump_ms=None, baseline_ms=100.0):
+    """The protocol the campaign ran, so a re-simulated row can be compared with the row.
+
+    Everything comes from config.py (the same getattr defaults culture_export uses) except:
+      i0_uA     from the rows themselves (a campaign run with --i0 records it in every row)
+      bump_ms   NOT recorded in a row. It must be the window the campaign used -- config
+                bump_ms, or ESTIM_BUMP_MS if the job overrode it (full_tuned_run.pbs passes it
+                through). A different window fits a different stretch of trace, and the
+                cross-check will then flag the taus as differing.
+      baseline  the one deliberate difference: 100 ms of pre-stimulus trace for the figure
+                instead of the campaign's 5 ms. A tuned cell is flat at rest, so DeltaV_end
+                is unchanged (measured: equal to 1e-6 mV); checked per example, not assumed.
+    """
+    i0s = sorted(set(round(_ff(r.get("i0_uA")), 3) for r in rows if r.get("i0_uA", "") != ""))
+    if len(i0s) > 1:
+        raise SystemExit("rows mix amplitudes %s uA -- filter the CSV to one amplitude" % i0s)
+    return default_protocol(
+        cfg, i0_uA=(i0s[0] if i0s else None),
+        bump_ms=float(getattr(cfg, "bump_ms", 800.0) if bump_ms is None else bump_ms),
+        bump_dt_ms=float(getattr(cfg, "bump_dt_ms", 0.5)),
+        cvode_atol=float(getattr(cfg, "cvode_atol", 1e-6)),
+        play_margin_ms=float(getattr(cfg, "play_margin_ms", 1.0)),
+        baseline_ms=float(baseline_ms))
+
+
+def main_from_csv(csv_path, n=24, select="stratified", cell_model="full_tuned",
+                  processes=1, bump_ms=None, baseline_ms=100.0, early_floor=None, t0_ms=None,
+                  per_page=12, detail_pages=True, select_seed=0, n_per_culture=None,
+                  out_pdf="campaign_examples.pdf", out_csv="campaign_examples.csv",
+                  verbose=True):
+    """Pick `n` neurons from a campaign CSV, re-simulate them, and write a gallery + one
+    detailed page each. See the section header for how the placements are recovered.
+
+    bump_ms / early_floor / t0_ms default to config (bump_ms, bump_early_floor, bump_t0_ms)
+    -- what the campaign used. Only the window is worth passing explicitly, when the campaign
+    ran with ESTIM_BUMP_MS.
+    """
+    from config import CFG
+    if early_floor is None:
+        early_floor = float(getattr(CFG, "bump_early_floor", 0.25))
+    if t0_ms is None:
+        t0_ms = float(getattr(CFG, "bump_t0_ms", 0.0))
+    here = os.path.dirname(os.path.abspath(__file__))
+    src, rows = load_campaign_rows(csv_path)
+    models = sorted(set(r.get("cell_model", "") for r in rows))
+    if models and models != [cell_model]:
+        raise SystemExit("%s holds cell_model %s but --cell-model is %r; the examples must be "
+                         "re-simulated with the model that produced the rows"
+                         % (src, models, cell_model))
+    places, skipped = recover_placements(rows, CFG, n_per_culture)
+    if verbose:
+        print("[examples] %s: %d rows, placements regenerated for %d, skipped %d"
+              % (src, len(rows), len(places), len(skipped)))
+    if skipped and verbose:
+        print("[examples] skipped rows do not match what culture_draws regenerates. Either "
+              "config.py (morphologies, span, electrodes) is not the one the campaign ran with, "
+              "or every culture was cut short -- then pass --neurons-per-culture")
+    chosen = select_examples(places, n, select, select_seed)
+    if not chosen:
+        raise SystemExit("nothing to plot (no rows could be recovered or selected)")
+    proto = campaign_protocol(CFG, [p["row"] for p in chosen], bump_ms, baseline_ms)
+    if verbose:
+        print("[examples] protocol: +/-%.1f uA, window %.0f ms after the pulse (MUST be the "
+              "campaign's), grid %.2f ms, play margin %.1f ms, early floor %.2f, baseline %.0f ms"
+              % (proto["i0_uA"], proto["bump_ms"], proto["bump_dt_ms"], proto["play_margin_ms"],
+                 early_floor, proto["baseline_ms"]))
+    jobs = [(k, p["morph"], p["layer"], p["x"], p["y"], p["theta"]) for k, p in enumerate(chosen)]
+    sims = simulate_groups(jobs, cell_model, proto, processes=processes, verbose=verbose)
+
+    items, out_rows = [], []
+    for k, p in enumerate(chosen):
+        meta, rec = sims[k]
+        fit = analyse(rec, t0_ms=t0_ms, early_floor=early_floor)
+        chk = campaign_check(rec, fit, p["row"])
+        items.append(dict(idx=k + 1, morph=p["morph"], layer=p["layer"], rec=rec, fit=fit,
+                          row=p["row"], check=chk, meta=meta))
+        r = p["row"]
+        out_rows.append([k + 1, r["seed"], r["culture"], r["neuron"]]
+                        + _row(meta, proto, rec, fit)
+                        + [r["dist_dipole3d_um"], chk["row_state"], r.get("dexp_peak_mV", ""),
+                           r.get("dexp_tau_decay_ms", ""), r.get("deltaVm_end_phase2_mV", ""),
+                           round(chk["dv_end_resim"], 6), "%.2e" % chk["d_dv_end"],
+                           chk["agrees"]])
+
+    pdf_path = out_pdf if os.path.isabs(out_pdf) else os.path.join(here, out_pdf)
+    title = "%d neurons from %s (%s)" % (len(items), os.path.basename(src), select)
+    with PdfPages(pdf_path) as pdf:
+        for fig in plot_gallery(items, proto, per_page=per_page, title=title):
+            pdf.savefig(fig)
+            plt.close(fig)
+        if detail_pages:
+            for it in items:
+                r, c = it["row"], it["check"]
+                note = ("#%d  campaign row: seed %s, culture %s, neuron %s  |  row: fit %s, "
+                        "peak %s mV, tau_decay %s ms, DeltaV_end %s mV  |  re-simulated "
+                        "DeltaV_end differs by %.1e mV  -> %s"
+                        % (it["idx"], r["seed"], r["culture"], r["neuron"], c["row_state"],
+                           r.get("dexp_peak_mV", "")[:7], r.get("dexp_tau_decay_ms", "")[:7],
+                           r.get("deltaVm_end_phase2_mV", "")[:8], c["d_dv_end"],
+                           "agrees" if c["agrees"] else "DIFFERS"))
+                pdf.savefig(plot_instance(it["rec"], it["fit"], it["meta"], proto,
+                                          note_line=note))
+                plt.close("all")
+
+    csv_out = out_csv if os.path.isabs(out_csv) else os.path.join(here, out_csv)
+    with open(csv_out, "w", newline="") as fh:
+        wr = csv.writer(fh)
+        wr.writerow(EXAMPLE_CSV_HEADER)
+        wr.writerows(out_rows)
+    if verbose:
+        n_ag = sum(it["check"]["agrees"] for it in items)
+        worst = float(np.nanmax([it["check"]["d_dv_end"] for it in items]))
+        print("[examples] re-simulation agrees with the campaign row for %d / %d "
+              "(worst |DeltaV_end| difference %.2e mV)" % (n_ag, len(items), worst))
+        print("done PDF:", pdf_path, "(%d gallery page(s) + %d detail pages)"
+              % (int(np.ceil(len(items) / float(per_page))),
+                 len(items) if detail_pages else 0))
+        print("done CSV:", csv_out)
+    return pdf_path, csv_out
+
+
 def _cli(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -743,10 +1245,27 @@ def _cli(argv=None):
                          "coarse grid (bump_kinetics.fit_post_pulse).")
     ap.add_argument("--placements", default=None,
                     help="morph:layer:x:y:theta, comma-separated. Default: a built-in spread.")
+    ap.add_argument("--from-csv", default=None,
+                    help="a campaign CSV (or its results directory): plot neurons the "
+                         "campaign actually simulated, re-simulated with the long window")
+    ap.add_argument("--n-examples", type=int, default=24, help="with --from-csv (default 24)")
+    ap.add_argument("--select", default="stratified", choices=list(SELECT_MODES),
+                    help="with --from-csv: which rows (default: accepted fits across the "
+                         "distance range + the rejected fits with the largest measured bump)")
+    ap.add_argument("--processes", type=int, default=0,
+                    help="with --from-csv: parallel simulation processes (0 = all cores "
+                         "the job was given)")
+    ap.add_argument("--neurons-per-culture", type=int, default=0,
+                    help="with --from-csv: N the cultures were drawn with (0 = infer from "
+                         "the rows; needed only if the walltime cut every culture short)")
+    ap.add_argument("--per-page", type=int, default=12, help="gallery tiles per page")
+    ap.add_argument("--no-detail-pages", action="store_true",
+                    help="with --from-csv: gallery only")
     ap.add_argument("--n-instances", type=int, default=6, help="how many default placements")
     ap.add_argument("--i0-uA", type=float, default=None, help="default: config.i0_uA")
-    ap.add_argument("--bump-ms", type=float, default=800.0,
-                    help="window integrated after the pulse (default 800)")
+    ap.add_argument("--bump-ms", type=float, default=None,
+                    help="window integrated after the pulse (default 800; with --from-csv, "
+                         "config.bump_ms -- pass the campaign's value if the job overrode it)")
     ap.add_argument("--bump-dt-ms", type=float, default=0.5, help="fixed output grid for fits")
     ap.add_argument("--baseline-ms", type=float, default=100.0,
                     help="pre-stimulus baseline drawn on the figure, to show the cell sits "
@@ -758,19 +1277,37 @@ def _cli(argv=None):
     ap.add_argument("--t0-ms", type=float, default=0.0,
                     help="anchor of the bump fit; 0 = end of phase 2 (the default, and the "
                          "only value for which the model is exactly specified)")
-    ap.add_argument("--early-floor", type=float, default=0.25,
+    ap.add_argument("--early-floor", type=float, default=None,
                     help="where the single-exponential fit stops, as a fraction of the peak. "
                          "The relaxation is multi-exponential, so tau_m moves with this; "
-                         "early_t_1e_ms in the CSV is the window-free number.")
+                         "early_t_1e_ms in the CSV is the window-free number. Default "
+                         "0.25; with --from-csv, config.bump_early_floor.")
     ap.add_argument("--out-pdf", default="plot_vm_examples.pdf")
     ap.add_argument("--out-csv", default="plot_vm_examples.csv")
     a = ap.parse_args(argv)
+    if a.from_csv:
+        procs = a.processes or int(os.environ.get("PBS_NUM_PPN", "0") or 0) or \
+            len(os.sched_getaffinity(0))
+        if a.mode != "staged":
+            ap.error("--from-csv re-fits with the campaign's staged fit; --fit joint does not "
+                     "apply")
+        return main_from_csv(a.from_csv, n=a.n_examples, select=a.select,
+                             cell_model=a.cell_model, processes=procs, bump_ms=a.bump_ms,
+                             baseline_ms=a.baseline_ms, early_floor=a.early_floor,
+                             per_page=a.per_page, detail_pages=not a.no_detail_pages,
+                             n_per_culture=(a.neurons_per_culture or None),
+                             out_pdf=(a.out_pdf if a.out_pdf != "plot_vm_examples.pdf"
+                                      else "campaign_examples.pdf"),
+                             out_csv=(a.out_csv if a.out_csv != "plot_vm_examples.csv"
+                                      else "campaign_examples.csv"))
     return main(cell_model=a.cell_model, mode=a.mode,
                 placements=(parse_placements(a.placements) if a.placements else None),
-                i0_uA=a.i0_uA, bump_ms=a.bump_ms, bump_dt_ms=a.bump_dt_ms,
+                i0_uA=a.i0_uA, bump_ms=(800.0 if a.bump_ms is None else a.bump_ms),
+                bump_dt_ms=a.bump_dt_ms,
                 play_margin_ms=a.play_margin_ms, baseline_ms=a.baseline_ms,
                 cvode_atol=a.cvode_atol, t0_ms=a.t0_ms,
-                early_floor=a.early_floor, n_instances=a.n_instances, out_pdf=a.out_pdf,
+                early_floor=(0.25 if a.early_floor is None else a.early_floor),
+                n_instances=a.n_instances, out_pdf=a.out_pdf,
                 out_csv=a.out_csv)
 
 

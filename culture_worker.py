@@ -101,9 +101,9 @@ def run_worker(culture_ids, out_csv, neurons_per_culture=None, layers=None,
     for API compatibility only (every distance metric is written to the CSV).
     """
     from config import CFG
-    from culture_export import (CellPool, culture_draws, iter_culture_blocks,
-                                resolve_cell_model, electrode_center, dipole_axis_deg,
-                                dipole_frame)
+    from culture_export import (CellPool, culture_draws, culture_has_kinetics,
+                                iter_culture_blocks, resolve_cell_model, electrode_center,
+                                dipole_axis_deg, dipole_frame)
     import field as F
 
     cfg = CFG
@@ -155,8 +155,14 @@ def run_worker(culture_ids, out_csv, neurons_per_culture=None, layers=None,
                 d = culture_draws(seed_used, c, N, M, span, elec, center, dip_c, dip_d, axis,
                                   cfg.h_soma_um)
                 t0 = time.time()
+                # the long post-pulse window on a (seed, culture)-determined subsample of
+                # cultures (config.bump_culture_fraction). This line was missing: the serial
+                # driver honoured the fraction and this, the PRODUCTION path, silently did not.
+                wk = culture_has_kinetics(seed_used, c,
+                                          getattr(cfg, "bump_culture_fraction", 1.0))
                 for rows, n_done in iter_culture_blocks(pool, c, d, morphs, layers, i0,
-                                                        n_pulses, seed_used, flush_every):
+                                                        n_pulses, seed_used, flush_every,
+                                                        with_kinetics=wk):
                     w.writerows(rows)
                     # flush() alone only reaches the LOCAL node's page cache; on a shared
                     # filesystem the login node can still see size 0. fsync() forces it out
