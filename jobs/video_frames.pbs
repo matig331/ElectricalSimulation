@@ -1,0 +1,121 @@
+#!/bin/bash
+# jobs/video_frames.pbs -- data + the three stimulation videos, on ONE node, all cores.
+#
+#   qsub jobs/video_frames.pbs                                   # defaults below
+#   qsub -v N_CULTURES=5,NEURONS=1700,SPAN=571.75,LAYERS=80,TMAX=200 jobs/video_frames.pbs
+#   qsub -v MODEL=soma_only jobs/video_frames.pbs                 # another cell model
+#   qsub -v RENDER=0 jobs/video_frames.pbs                        # data only, render later
+#
+# Step 1  video_frames.py: every neuron x layer of every culture, DeltaV(t) vs sham on the frame
+#         grid, in parallel (one live cell per worker). Stops if DeltaV_end differs from the
+#         campaign definition.
+# Step 2  (RENDER=1) make_prob_videos.py: video 1 (all cultures, probability)
+#         make_culture_videos.py: videos 2 and 3 (cultures CULTURE_IDS, one layer)
+#
+# Cost: ~20 s per neuron x layer at an 800 ms window (jobs/vm_examples.pbs); 200 ms is cheaper.
+# 5 cultures x 1700 x 1 layer = 8500 sims -> ~1.5 h on 32 cores at the 800-ms bound.
+#PBS -N estim_video_frames
+#PBS -l nodes=1:ppn=32
+#PBS -l walltime=04:00:00
+#PBS -q cpu
+#PBS -j oe
+#PBS -o logs/estim_video_frames.log
+
+set -euo pipefail
+
+REPO=""
+for cand in "${PBS_O_WORKDIR:-}" "${PBS_O_WORKDIR:-}/.." "$PWD" "$PWD/.." "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)"; do
+    if [ -n "$cand" ] && [ -f "$cand/video_frames.py" ]; then
+        REPO="$(cd "$cand" && pwd)"; break
+    fi
+done
+if [ -z "$REPO" ]; then echo "FATAL: repo not found (no video_frames.py)" >&2; exit 1; fi
+cd "$REPO"
+mkdir -p logs
+
+if [ -f jobs/env_setup.sh ]; then
+    source jobs/env_setup.sh
+else
+    echo "NOTE: jobs/env_setup.sh absent -- relying on the ambient environment"
+fi
+
+# ------------------------------------------------------------------ parameters (qsub -v ...)
+MODEL="${MODEL:-}"                 # empty -> config.cell_model
+N_CULTURES="${N_CULTURES:-5}"
+FIRST="${FIRST:-0}"                # cultures FIRST .. FIRST+N_CULTURES-1
+NEURONS="${NEURONS:-1700}"         # per culture
+SPAN="${SPAN:-571.75}"             # half-side of the soma square (um); 1700 at 1300/mm^2
+LAYERS="${LAYERS:-80}"             # e.g. 80  or  40,80,120
+TMAX="${TMAX:-200}"                # ms after the pulse
+SEED="${SEED:-}"                   # empty -> config.seed
+CHUNK="${CHUNK:-50}"               # neurons per task
+RENDER="${RENDER:-1}"
+CULTURE_IDS="${CULTURE_IDS:-0 1}"  # the two cultures of videos 2-3 (ids from --list)
+HALF="${HALF:-600}"                # map half-width in the videos (um)
+SIGMA="${SIGMA:-20}"               # smoothing of video 1 (um)
+TAG="${MODEL:-cfg}"
+OUT="${OUT:-video_run_${TAG}_$(date +%Y%m%d_%H%M)}"
+NPROC="${PBS_NUM_PPN:-${PBS_NP:-$(nproc)}}"
+mkdir -p "$OUT"
+
+# ------------------------------------------------------------------ prerequisites
+python - <<'PY'
+import inspect, sys
+missing = []
+try:
+    import rich_footprint
+    p = inspect.signature(rich_footprint.spikes_at).parameters
+    for a in ("bump_ms", "bump_dt_ms", "cvode_atol", "play_margin_ms", "pre_end_ms", "detail"):
+        if a not in p:
+            missing.append("rich_footprint.spikes_at(%s=...)" % a)
+except Exception as exc:
+    missing.append("rich_footprint: %s" % exc)
+try:
+    import culture_export as CE
+    for a in ("CellPool", "culture_draws", "v_at_end_of_phase2", "phase2_end_outcome",
+              "dipole_frame", "dipole_axis_deg", "electrode_center"):
+        if not hasattr(CE, a):
+            missing.append("culture_export.%s" % a)
+except Exception as exc:
+    missing.append("culture_export: %s" % exc)
+try:
+    import bump_kinetics
+    if not hasattr(bump_kinetics, "common_prefix_len"):
+        missing.append("bump_kinetics.common_prefix_len")
+except Exception as exc:
+    missing.append("bump_kinetics: %s" % exc)
+if missing:
+    print("FATAL: the repo is not the current HPC code. Missing:", *missing, sep="\n  - ", file=sys.stderr)
+    sys.exit(2)
+print("prerequisites OK")
+PY
+
+if [ "${SMOKE:-1}" != "0" ]; then
+    echo "--- offline smoke test (no NEURON) ---"
+    python smoke_video_frames.py | tail -1
+fi
+command -v ffmpeg >/dev/null 2>&1 || echo "NOTE: ffmpeg not found -> the videos will be GIF"
+
+echo "model      : ${MODEL:-config.cell_model}"
+echo "cultures   : $N_CULTURES from $FIRST, $NEURONS neurons, span +/-$SPAN um, layers $LAYERS"
+echo "window     : $TMAX ms after the pulse     processes: $NPROC     output: $OUT"
+echo "---------------------------------------------------------------"
+
+ARGS=(--n-cultures "$N_CULTURES" --first-culture "$FIRST" --neurons "$NEURONS"
+      --span-um "$SPAN" --layers "$LAYERS" --tmax-ms "$TMAX" --chunk "$CHUNK"
+      --processes "$NPROC" --out "$OUT")
+[ -n "$MODEL" ] && ARGS+=(--cell-model "$MODEL")
+[ -n "$SEED" ] && ARGS+=(--seed "$SEED")
+python video_frames.py "${ARGS[@]}"      # exits non-zero if DeltaV_end differs from the campaign
+
+if [ "$RENDER" = "1" ]; then
+    FIRST_LAYER="${LAYERS%%,*}"
+    echo "--- video 1: probability, all cultures ---"
+    python make_prob_videos.py --frames "$OUT/culture_frames_S*_C*.csv" --half "$HALF" \
+        --sigma "$SIGMA" --outdir "$OUT"
+    echo "--- videos 2-3: cultures $CULTURE_IDS, layer $FIRST_LAYER ---"
+    python make_culture_videos.py --frames "$OUT/culture_frames_S*_C*.csv" --list
+    python make_culture_videos.py --frames "$OUT/culture_frames_S*_C*.csv" --cultures $CULTURE_IDS \
+        --layer "$FIRST_LAYER" --half "$HALF" --outdir "$OUT"
+fi
+echo "done -> $OUT"

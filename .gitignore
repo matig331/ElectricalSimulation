@@ -26,6 +26,13 @@ recruitment_Pactivation.csv
 *.o[0-9]*
 *.e[0-9]*
 
+# Stimulation videos (jobs/video_frames.pbs): run outputs and the smoke tests' scratch dirs
+video_run*/
+video_test/
+_smoke_video_frames/
+_smoke_videos/
+_smoke_culture/
+
 # Temp per-worker slice files (created and deleted during a run; stray leftovers
 # from a killed job could otherwise get committed by accident)
 _cw*.asc

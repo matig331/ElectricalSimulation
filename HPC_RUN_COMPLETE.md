@@ -212,6 +212,29 @@ Optional movie (interactive/laptop; needs ffmpeg, else use a .gif name):
 python culture_vm_animation.py --input merged_soma_only --output culture_vm_animation.mp4
 ```
 
+### Stimulation videos with the real DeltaV(t) of every neuron
+
+`culture_vm_animation.py` only has the END outcome of each neuron. The video pipeline
+re-simulates the campaign's own cultures (same `culture_draws`, same `CellPool`, same sham) and
+records DeltaV(t) = V_stim(t) - V_sham(t) of every soma on a frame grid, from 0.6 ms before the end
+of the pulse to `TMAX` ms after it. It then renders three videos: the ensemble probability map
+(all cultures) and two single-culture views with the field, the morphologies and every soma
+coloured by its DeltaV(t). Every neuron's DeltaV_end is checked against the campaign definition
+and the job refuses to render if they differ. See `VIDEO_HOWTO.md` for what each video shows,
+every parameter, and the checks to make before using one.
+
+```bash
+python smoke_video_frames.py                       # offline, no NEURON: must end with ALL PASSED
+qsub jobs/video_frames.pbs                         # 5 cultures x 1700 neurons, layer 80, 200 ms tail, 3 videos
+qsub -v RENDER=0 jobs/video_frames.pbs             # data only; render later (no NEURON needed):
+python make_prob_videos.py    --frames "video_run_<...>/culture_frames_S*_C*.csv" --outdir video_run_<...>
+python make_culture_videos.py --frames "video_run_<...>/culture_frames_S*_C*.csv" --cultures 0 1 --layer 80 --outdir video_run_<...>
+```
+
+Options (`-v`, comma-separated): `NEURONS`, `SPAN`, `N_CULTURES`, `FIRST`, `LAYERS`, `TMAX`,
+`MODEL`, `SEED`, `CHUNK`, `CULTURE_IDS`, `HALF`, `SIGMA`, `RENDER`. Log: `logs/estim_video_frames.log`;
+results: `video_run_<model>_<date>_<time>/`. Cost: 8500 sims, about 1.5 h on 32 cores at worst.
+
 ### All figures as ONE batch job (merge once, then everything in parallel)
 
 ```bash
