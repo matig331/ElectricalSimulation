@@ -9,13 +9,21 @@
 #        depol / hyperpol  statistics + P map, once per |DeltaV_end| threshold
 #                                                      -> stats/dv_<T>mV/<outcome>, maps/dv_<T>mV/
 #        Vm movie (labels at DV_MAIN)                  -> vm_movie.mp4 (or .gif without ffmpeg)
+#      full_tuned only, two more:
+#        post-pulse Ih bump statistics                 -> bump_statistics.pdf / .csv
+#        example traces of the campaign's own neurons  -> campaign_examples.pdf / .csv
+#          (re-simulated with NEURON, drawn from ONE job's merge -- see EXAMPLES_FROM)
 #
 # With 3 thresholds that is 15 independent tasks, so ppn=16: more cores would sit idle
 # (48 queues longer and finishes no sooner). Each task gets (cores / tasks) numpy threads.
 #
 # Submit from the pipeline folder:   qsub jobs/analysis.pbs
 # Options, comma-separated:          qsub -v DEDUPE=1,MOVIE=0 jobs/analysis.pbs
-#   PARTS=...    parts folders to merge      (default: results_<cell_model>/parts_*)
+# The full_tuned campaign (quote the glob):
+#   qsub -v "PARTS=results_full_tuned/parts_ftc*" jobs/analysis.pbs
+#   PARTS=...    parts folders to merge      (default: results_<cell_model>/parts_*; REQUIRED
+#                for full_tuned unless MERGED is given: results_full_tuned/ also holds test
+#                runs -- dry runs, ft1000_* -- that must not be pooled with a campaign)
 #   MERGED=...   reuse an existing merged folder instead of merging again
 #   DV_THRESHOLDS=0.5:1:2   |DeltaV_end| thresholds in mV, colon-separated (0 = sign only)
 #   DV_MAIN=1    threshold used for the movie's labels
@@ -23,6 +31,16 @@
 #   DEDUPE=1     --dedupe-identical in the statistics (only for batches sharing seeds)
 #   MOVIE=0      skip the Vm movie
 #   DIST_BIN, ANGLE_BIN, ORIENT_BIN, XY_BIN   statistics bins (default 5, 5, 5, 10)
+#   MAX_TASKS=N  run at most N tasks at once (default: all). Each statistics task holds its
+#                whole outcome file in memory: ~1.1 kB per row, i.e. ~6.6 GB for the 6.12 M
+#                rows of the full campaign -- lower this on a node with little memory.
+#   full_tuned only:
+#   BUMP=0       skip the bump statistics          BUMP_BIN=40   its distance bin (um)
+#   EXAMPLES=0   skip the example traces           N_EXAMPLES=24, SELECT=stratified, EX_PROC=4
+#   EXAMPLES_FROM=results_full_tuned/<job>/culture_Pactivation.csv   the rows to draw them from.
+#                Default: the per-job merge of the first job matched by PARTS. Not the whole
+#                merge: the examples script reads every row into memory, fine for one job's
+#                245k rows, not for millions.
 # ---------------------------------------------------------------------------
 #PBS -N estim_analysis
 #PBS -l nodes=1:ppn=16
@@ -46,6 +64,14 @@ source jobs/env_setup.sh
 source jobs/results_layout.sh
 
 MODEL="${MODEL:-$(cfg_cell_model)}"
+if [ "$MODEL" = "full_tuned" ] && [ -z "${PARTS:-}" ] && [ -z "${MERGED:-}" ]; then
+    echo "FATAL: for full_tuned give the campaign's parts, e.g." >&2
+    echo "         qsub -v \"PARTS=results_full_tuned/parts_ftc*\" jobs/analysis.pbs" >&2
+    echo "       results_full_tuned/ also holds test runs that must not be pooled with it:" >&2
+    for d in results_full_tuned/parts_*/; do [ -d "$d" ] && echo "         $d" >&2; done
+    exit 1
+fi
+PARTS_GIVEN="${PARTS:+1}"
 PARTS="${PARTS:-results_${MODEL}/parts_*}"
 OUT="${OUT:-analysis/${MODEL}_$(date +%Y%m%d_%H%M)}"
 NP="${PBS_NUM_PPN:-${PBS_NP:-$(nproc)}}"
@@ -53,7 +79,12 @@ LOGS="$OUT/logs"
 mkdir -p "$LOGS"
 
 echo "model  : $MODEL"
-echo "parts  : $PARTS"
+if [ -z "${MERGED:-}" ]; then
+    echo "parts  : $PARTS"
+    for d in $PARTS; do [ -d "$d" ] && echo "         $d"; done
+else
+    echo "parts  : not merged again (MERGED=$MERGED)"
+fi
 echo "output : $OUT"
 echo "cores  : $NP"
 echo "---------------------------------------------------------------"
@@ -95,18 +126,46 @@ if [ "${MOVIE:-1}" = "1" ] && [ "$MODEL" = "soma_only" ] && [ "${#OUTCOMES[@]}" 
 fi
 if command -v ffmpeg >/dev/null 2>&1; then EXT=mp4; else EXT=gif; fi
 
-NTASK=$DO_MOVIE
+# full_tuned: the post-pulse kinetics, and example traces re-simulated from one job's rows
+DO_BUMP=0
+DO_EX=0
+EX_SRC=""
+if [ "$MODEL" = "full_tuned" ]; then
+    if [ "${BUMP:-1}" = "1" ]; then DO_BUMP=1; fi
+    if [ "${EXAMPLES:-1}" = "1" ]; then
+        EX_SRC="${EXAMPLES_FROM:-}"
+        if [ -z "$EX_SRC" ] && [ -n "$PARTS_GIVEN" ]; then
+            for d in $PARTS; do
+                t="${d%/}"; t="${t##*/parts_}"
+                if [ -f "results_${MODEL}/${t}/culture_Pactivation.csv" ]; then
+                    EX_SRC="results_${MODEL}/${t}/culture_Pactivation.csv"; break
+                fi
+            done
+        fi
+        if [ -n "$EX_SRC" ] && [ -e "$EX_SRC" ]; then
+            DO_EX=1
+        else
+            echo "NOTE: example traces skipped -- no per-job merge found${EX_SRC:+ ($EX_SRC)};" \
+                 "give EXAMPLES_FROM=results_${MODEL}/<job>/culture_Pactivation.csv"
+        fi
+    fi
+fi
+
+NTASK=$((DO_MOVIE + DO_BUMP + DO_EX))
 for o in "${OUTCOMES[@]}"; do
     if [ "$o" = "activation" ]; then NTASK=$((NTASK + 2)); else NTASK=$((NTASK + 2 * ${#THRS[@]})); fi
 done
 THREADS=$(( NP / NTASK )); if [ "$THREADS" -lt 1 ]; then THREADS=1; fi
 export OMP_NUM_THREADS=$THREADS OPENBLAS_NUM_THREADS=$THREADS MKL_NUM_THREADS=$THREADS
-echo "[2/2] $NTASK tasks in parallel (outcomes: ${OUTCOMES[*]}; |DeltaV| thresholds: ${THRS[*]} mV; movie: $DO_MOVIE), $THREADS thread(s) each"
+MAX_TASKS="${MAX_TASKS:-$NTASK}"
+if [ "$MAX_TASKS" -lt 1 ]; then MAX_TASKS=1; fi
+echo "[2/2] $NTASK tasks, at most $MAX_TASKS at once (outcomes: ${OUTCOMES[*]}; |DeltaV| thresholds: ${THRS[*]} mV; movie: $DO_MOVIE; bump statistics: $DO_BUMP; examples: $DO_EX${EX_SRC:+ from $EX_SRC}), $THREADS thread(s) each"
 
 NAMES=()
 declare -A PIDS
 launch() {                     # launch NAME CMD... : run in the background, own log
     local name=$1; shift
+    while [ "$(jobs -rp | wc -l)" -ge "$MAX_TASKS" ]; do sleep 5; done
     "$@" > "$LOGS/$name.log" 2>&1 &
     PIDS[$name]=$!
     NAMES+=("$name")
@@ -130,6 +189,17 @@ if [ "$DO_MOVIE" = "1" ]; then
     launch movie python culture_vm_animation.py --input "$MERGED" --dv-threshold "$DV_MAIN" \
         --output "$OUT/vm_movie_dv${DV_MAIN}mV.$EXT"
 fi
+if [ "$DO_BUMP" = "1" ]; then
+    launch bump_statistics python plot_bump_statistics.py --input "$MERGED/culture_Pactivation.csv" \
+        --bin-um "${BUMP_BIN:-40}" --out-pdf "$OUT/bump_statistics.pdf" \
+        --out-csv "$OUT/bump_statistics.csv"
+fi
+if [ "$DO_EX" = "1" ]; then
+    launch campaign_examples python plot_vm_examples.py --cell-model "$MODEL" \
+        --from-csv "$EX_SRC" --n-examples "${N_EXAMPLES:-24}" --select "${SELECT:-stratified}" \
+        --processes "${EX_PROC:-4}" --out-pdf "$OUT/campaign_examples.pdf" \
+        --out-csv "$OUT/campaign_examples.csv"
+fi
 
 FAIL=0
 for name in "${NAMES[@]}"; do
@@ -137,6 +207,12 @@ for name in "${NAMES[@]}"; do
         echo "  OK    $name"
     else
         rc=$?
+        if [ "$name" = "campaign_examples" ]; then
+            # re-simulated illustrations: their failure must not make the statistics look failed
+            echo "  WARN  $name (exit $rc) -- the statistics are unaffected; last lines of $LOGS/$name.log:"
+            tail -5 "$LOGS/$name.log" | sed 's/^/        /'
+            continue
+        fi
         echo "  FAIL  $name (exit $rc) -- last lines of $LOGS/$name.log:"
         tail -5 "$LOGS/$name.log" | sed 's/^/        /'
         FAIL=1

@@ -259,24 +259,32 @@ def absolute_theta(row):
     c = (int(row["local_culture"]) if "local_culture" in row.index and pd.notna(row["local_culture"])
          else int(row["culture"]))
     i = int(row["neuron"])
-    N = int(CFG.n_neurons_effective())
     elec, sign = F.default_array(pitch_um=CFG.pitch_um, monopolar=not CFG.bipolar)
     dip_c, dip_d = CE.dipole_frame(elec, sign)
-    d = CE.culture_draws(seed, c, N, len(CFG.morphologies), CFG.span_half_um(), elec,
-                         CE.electrode_center(elec), dip_c, dip_d,
-                         CE.dipole_axis_deg(elec, sign), CFG.h_soma_um)
-    ok = (i < N
-          and round(float(d["pos"][i, 0]), 2) == float(row["x_um"])
-          and round(float(d["pos"][i, 1]), 2) == float(row["y_um"])
-          and str(CFG.morphologies[int(d["midx"][i])]) == _morph_str(row["morphology"])
-          and abs(round(float(d["th_or"][i]), 1) - float(row["theta_orient_deg"])) < 0.051)
-    if not ok:
-        raise ValueError(
-            f"cannot recover the simulated orientation of seed={seed} culture={c} neuron={i}: "
-            f"the draw regenerated with the CURRENT config.py does not match the CSV row. Run the "
-            f"animation with the same config the simulations used (morphologies, neuron count "
-            f"{N}, span {CFG.span_half_um()} um, electrodes).")
-    return float(d["theta"][i]), float(d["pos"][i, 0]), float(d["pos"][i, 1])
+    # the current soma square and culture size first, then those of the campaigns before
+    # 2026-09-28 (+/-500 um around (0, 0), the biological count): a row must match exactly
+    tried = []
+    for fr in CE.placement_frames(CFG, elec, sign):
+        N = int(CFG.n_neurons_hpc() if fr["legacy"] else CFG.n_neurons_effective())
+        tried.append("N %d, +/-%g um around (%g, %g)" % (N, fr["span"], fr["center"][0],
+                                                         fr["center"][1]))
+        if i >= N:
+            continue
+        d = CE.culture_draws(seed, c, N, len(CFG.morphologies), fr["span"], elec,
+                             CE.electrode_center(elec), dip_c, dip_d,
+                             CE.dipole_axis_deg(elec, sign), CFG.h_soma_um,
+                             place_center=fr["center"])
+        ok = (round(float(d["pos"][i, 0]), 2) == float(row["x_um"])
+              and round(float(d["pos"][i, 1]), 2) == float(row["y_um"])
+              and str(CFG.morphologies[int(d["midx"][i])]) == _morph_str(row["morphology"])
+              and abs(round(float(d["th_or"][i]), 1) - float(row["theta_orient_deg"])) < 0.051)
+        if ok:
+            return float(d["theta"][i]), float(d["pos"][i, 0]), float(d["pos"][i, 1])
+    raise ValueError(
+        f"cannot recover the simulated orientation of seed={seed} culture={c} neuron={i}: "
+        f"no draw regenerated with config.py matches the CSV row (tried {'; '.join(tried)}). "
+        f"Run the animation with the config the simulations used (morphologies, neuron count, "
+        f"soma square, electrodes).")
 
 
 def simulate_selected(row, post_ms=6.0):

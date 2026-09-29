@@ -97,6 +97,8 @@ DISTANCE_LABEL = "Distance from dipole centre (um)"
 # but negligible responses. A threshold keeps only responses of physiological size.
 # 0 = keep the CSV's sign-only labels.
 POLARIZATION_OUTCOMES = ("depolarization", "hyperpolarization")
+# column-name prefixes of the post-pulse kinetics (bump_kinetics.STAGED_COLUMNS), skipped on load
+KINETICS_PREFIXES = ("early_", "dexp_")
 DEFAULT_DV_THRESHOLD_MV = 1.0
 DV_COL = "deltaVm_end_phase2_mV"
 
@@ -163,7 +165,12 @@ def load_and_merge(files: Sequence[Path], outcome_col: str, dedupe_identical: bo
     models: dict[str, list[str]] = {}
 
     for file_index, path in enumerate(files):
-        df = pd.read_csv(path)
+        # the post-pulse kinetics columns (early_*, dexp_*: 24 of the 45 in a full_tuned file)
+        # are never used by these statistics; not reading them halves the memory of a
+        # multi-million-row campaign (7 of these processes run at once in jobs/analysis.pbs)
+        header = pd.read_csv(path, nrows=0).columns
+        df = pd.read_csv(path, usecols=[c for c in header
+                                        if not str(c).startswith(KINETICS_PREFIXES)])
         missing = REQUIRED_BASE_COLUMNS.difference(df.columns)
         if missing:
             raise ValueError(f"{path} is missing columns: {sorted(missing)}")

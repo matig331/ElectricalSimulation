@@ -30,13 +30,14 @@ def check(name, cond, detail=""):
 
 
 def write_part(path, seed, cultures, n_neurons, layers, rng):
-    """Valid current-schema rows: exclusive outcomes, every neuron at every layer."""
+    """Valid soma_only rows (the 22-column outcome schema, no kinetics columns -- what the
+    soma_only campaign's parts hold): exclusive outcomes, every neuron at every layer."""
     labels = {"activation": (1, 0, 0), "depol": (0, 1, 0), "hyperpol": (0, 0, 1),
               "neutral": (0, 0, 0)}
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", newline="") as fh:
         w = csv.writer(fh)
-        w.writerow(CE.CSV_HEADER)
+        w.writerow(CE.OUTCOME_CSV_HEADER)
         for c in cultures:
             for n in range(n_neurons):
                 x, y = rng.uniform(-300, 300, 2)

@@ -8,11 +8,19 @@
 #   bash jobs/merge_all.sh                  # model = config.cell_model
 #   MODEL=full_active bash jobs/merge_all.sh
 #   bash jobs/merge_all.sh --no-figures     # CSVs only (faster)
+#   PARTS='results_full_tuned/parts_ftc*' bash jobs/merge_all.sh --no-figures
 #
-# in : results_<model>/parts_*/part_*.csv
-# out: merged_<model>/culture_P{activation,depolarization,hyperpolarization}.csv
-#      merged_<model>/culture_Pmap_<outcome>.pdf
-#   -> then: python culture_statistics.py --input merged_<model> --output stats_<model>
+# Env: MODEL = cell model (default config.cell_model)
+#      PARTS = glob of the parts directories to merge (QUOTE it). Default
+#              results_<model>/parts_* -- except for full_tuned, where it is REQUIRED:
+#              that tree also holds the test runs (dry runs, ft1000_*), whose cultures are
+#              not biological size and must not be pooled with a campaign.
+#      OUT   = output folder (default merged_<model>)
+#
+# in : $PARTS/part_*.csv
+# out: $OUT/culture_P{activation,depolarization,hyperpolarization}.csv
+#      $OUT/culture_Pmap_<outcome>.pdf
+#   -> then: python culture_statistics.py --input $OUT --output stats_<model>
 # merged_<model>/ is a SIBLING of results_<model>/ on purpose: pointing
 # culture_statistics.py at results_<model>/ can then never count a job twice.
 # ---------------------------------------------------------------------------
@@ -25,20 +33,31 @@ if [ -z "${MODEL:-}" ]; then
     MODEL="$(cfg_cell_model)"
 fi
 case "$MODEL" in
-    soma_only|full_active) ;;
-    *) echo "FATAL: MODEL='$MODEL' (expected soma_only or full_active)" >&2; exit 1 ;;
+    soma_only|full_active|full_tuned) ;;
+    *) echo "FATAL: MODEL='$MODEL' (expected soma_only, full_active or full_tuned)" >&2; exit 1 ;;
 esac
 
+if [ -z "${PARTS:-}" ] && [ "$MODEL" = "full_tuned" ]; then
+    echo "FATAL: for full_tuned give the campaign's parts explicitly, e.g." >&2
+    echo "         PARTS='results_full_tuned/parts_ftc*' bash jobs/merge_all.sh" >&2
+    echo "       results_full_tuned/ also holds test runs that must not be pooled with it:" >&2
+    for d in results_full_tuned/parts_*/; do
+        [ -d "$d" ] && echo "         $d" >&2
+    done
+    exit 1
+fi
+PARTS="${PARTS:-results_${MODEL}/parts_*}"
+OUT="${OUT:-merged_${MODEL}}"
+
 N=0
-for d in "results_${MODEL}"/parts_*/; do
+for d in $PARTS; do
     [ -d "$d" ] && N=$((N + 1))
 done
 if [ "$N" -eq 0 ]; then
-    echo "FATAL: no results_${MODEL}/parts_*/ directories in $REPO -- nothing to merge." >&2
+    echo "FATAL: no directory matches PARTS='$PARTS' in $REPO -- nothing to merge." >&2
     exit 1
 fi
-echo "model $MODEL: $N job director$([ "$N" -eq 1 ] && echo y || echo ies) under results_${MODEL}/"
+echo "model $MODEL: $N job director$([ "$N" -eq 1 ] && echo y || echo ies) matching '$PARTS' -> $OUT"
 
-python culture_merge.py --parts "results_${MODEL}/parts_*" --out-dir "merged_${MODEL}" \
-       --expect-model "$MODEL" "$@"
-echo "next: python culture_statistics.py --input merged_${MODEL} --output stats_${MODEL}"
+python culture_merge.py --parts "$PARTS" --out-dir "$OUT" --expect-model "$MODEL" "$@"
+echo "next: python culture_statistics.py --input $OUT --output stats_${MODEL}"

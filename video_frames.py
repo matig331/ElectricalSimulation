@@ -86,12 +86,16 @@ def _pool_class():
         def _run(self, key, pos_xy, theta_deg, i0_uA):
             from rich_footprint import spikes_at
             kin = self._info[key].get("kin") or {}
+            # the campaign's rest before the pulse too (culture_export.pre_stim_split): the
+            # pool's sham, v_sham_end, was run with it, and DeltaV_end is checked against it
             return spikes_at(self._cell, (float(pos_xy[0]), float(pos_xy[1])), float(theta_deg),
                              i0_uA=float(i0_uA), detail=True, pre_end_ms=PRE_END_MS,
                              v_init_mV=self._info[key]["v_rest"], bump_ms=self.tmax_ms,
                              bump_dt_ms=float(kin.get("bump_dt_ms", 0.5)),
                              cvode_atol=float(kin.get("cvode_atol", 1e-6)),
-                             play_margin_ms=float(kin.get("play_margin_ms", 1.0)))
+                             play_margin_ms=float(kin.get("play_margin_ms", 1.0)),
+                             baseline_ms=float(kin.get("baseline_ms", 5.0)),
+                             pre_settle_ms=float(kin.get("pre_settle_ms", 0.0)))
 
         def trace(self, morph, layer, pos_xy, theta_deg, i0_uA):
             key = self._activate(morph, layer)
@@ -173,7 +177,8 @@ def _geometry(cfg):
     import field as F
     elec, sign = F.default_array(pitch_um=cfg.pitch_um, monopolar=not cfg.bipolar)
     return dict(elec=elec, sign=sign, center=CE.electrode_center(elec),
-                axis=CE.dipole_axis_deg(elec, sign), dip=CE.dipole_frame(elec, sign))
+                axis=CE.dipole_axis_deg(elec, sign), dip=CE.dipole_frame(elec, sign),
+                place_center=CE.placement_frame(cfg, elec, sign)[1])
 
 
 def run_chunk(task):
@@ -186,7 +191,7 @@ def run_chunk(task):
     morphs = [str(m) for m in CFG.morphologies]
     dc, dd = g["dip"]
     d = CE.culture_draws(seed, c, N, len(morphs), span, g["elec"], g["center"], dc, dd, g["axis"],
-                         CFG.h_soma_um)
+                         CFG.h_soma_um, place_center=g["place_center"])
     times = np.asarray(task["times"], float)
     idx = list(range(i_start, i_end))
     order = sorted(((int(d["midx"][i]), L, i) for i in idx for L in layers))   # group by cell

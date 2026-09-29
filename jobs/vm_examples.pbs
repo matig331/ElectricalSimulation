@@ -29,7 +29,7 @@
 #                    soma_only is the NEGATIVE control: Ih is dendritic, so it has no bump
 #   N=...            how many of the built-in default placements (default 6)
 #   PLACEMENTS=...   explicit list, morph:layer:x:y:theta, comma-separated (overrides N)
-#   BUMP_MS=...      window integrated after the pulse (default 800)
+#   BUMP_MS=...      window integrated after the pulse (default config.bump_ms)
 #   FIT=...          staged (default) | joint
 #   EARLY_FLOOR=...  where the single-exponential fit stops, as a fraction of the peak (0.25)
 #   I0=...           stimulus amplitude in uA (default: config.i0_uA)
@@ -66,7 +66,8 @@ else
 fi
 
 MODEL="${MODEL:-full_tuned}"
-BUMP_MS="${BUMP_MS:-800}"
+# default: the window config.py defines (the campaign's; the rows do not record it)
+BUMP_MS="${BUMP_MS:-$(python -c 'from config import CFG; print(CFG.bump_ms)' 2>/dev/null)}"
 FIT="${FIT:-staged}"
 EARLY_FLOOR_SET="${EARLY_FLOOR:-}"
 EARLY_FLOOR="${EARLY_FLOOR:-0.25}"

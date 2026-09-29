@@ -261,6 +261,91 @@ Output: `stats/activation/`, `stats/dv_<T>mV/{depolarization,hyperpolarization}/
 cores would sit idle). Memory: ~7 statistics processes on 3.7 M rows at once, several GB each;
 disk: each statistics folder writes a merged CSV of ~1 GB.
 
+## 6. Part D -- the full_tuned campaign (one pulse per neuron, 600 x 600 um square)
+
+**Protocol of every simulation** (one neuron at one slice thickness), all set in `config.py`:
+
+| step | duration | integration |
+|---|---|---|
+| rest, stimulus off (`pre_stim_ms` = 50) | 45 ms, then 5 ms | variable step (CVODE), then fixed 0.025 ms |
+| ONE biphasic pulse, +/-50 uA per electrode, anodic first | 2 x 0.25 ms | fixed 0.025 ms |
+| after the pulse (`bump_ms` = 1000) | 3 ms, then 997 ms | fixed 0.025 ms, then CVODE |
+
+Then the row is written and the next neuron starts from a fresh initialisation: there is never a
+second pulse (the `n_pulses` column is 1). The cell starts at its own settled rest (leak-tuned, a
+true equilibrium), so the rest is a steady state -- the sham's soma moves < 2e-5 mV over it --
+and integrating its first 45 ms at a variable step changes nothing: DeltaV_end within 2e-6 mV of
+the same rest at fixed dt, identical spikes and fits, for ~0.3 s instead of ~2 s per simulation
+(`smoke_test_protocol.py` checks all of it on the cluster's NEURON).
+
+**Placement and culture.** Somata uniform in a 600 x 600 um square (`placement_half_um` = 300)
+centred on the dipole centre of the array (0, -30 um), inside the 1 x 1 mm well; 2000 neurons per
+culture (`neurons_per_culture`: neurons never interact, so a culture is a bookkeeping unit -- one
+random realisation with its own seed -- not a density).
+
+**Launch** -- `jobs/launch_campaign.sh` sizes the campaign from config.py and checks everything
+before the first qsub: TARGET_NEURONS = 2,000,000 -> 21 jobs `ftd01`..`ftd21` x 48 cultures x 2000
+neurons = 2,016,000 neurons, 6,048,000 simulations; seeds 50000..70000 (culture c of seed s draws
+from `default_rng(s + c)`; step 1000 > 48 cultures, and the script refuses seeds whose cultures an
+earlier full_tuned run already drew); one culture per core; rows fsync'ed every 10 neurons; 24 h
+walltime, queue cpu. It refuses a second submission while the jobs are queued, another cell model,
+and a walltime shorter than the predicted worst case; `DRY=1` prints the plan only; `FIRST=k`
+resumes after a queue limit stopped qsub part-way. Plan and job ids go to
+`results_full_tuned/campaign_ftd.log`.
+
+```bash
+python smoke_test_campaign_setup.py | tail -1        # offline, seconds: ALL PASSED
+python smoke_test_protocol.py | tail -1              # NEURON, ~2 min: ALL PASSED
+DRY=1 bash jobs/launch_campaign.sh                   # the plan, nothing submitted
+bash jobs/launch_campaign.sh                         # submit
+```
+
+**Cost.** ~3.9 s per simulation on one cluster core (1.27 x the 3.1 s measured for the earlier
+5 ms / 800 ms protocol): 6000 simulations per core = ~6.5 h per job, up to ~17 h if 48 workers slow
+each other down as on the full-active campaign. ~6,600 CPU-hours in total.
+
+**Memory.** NEURON 9.0.2 keeps ~96 bytes for every hoc object ever created, freed or not, and each
+switch from the variable-step solver back to the fixed step retains ~0.1 MB more. The play vectors
+(one per segment, ~1250) are now pooled and refilled in place, which removed ~0.15 MB per
+simulation; what remains was measured at ~0.25 MB per simulation in a real worker (40 neurons x 3
+layers, flush every 10), i.e. ~1.5 GB per worker by the end of its 6000 simulations and ~75 GB on
+a 48-worker node (plus the workers' starting size): about 36 MB x neurons_per_culture per node.
+Check the nodes have well over that (`pbsnodes -a | grep resources_available.mem`). If they do
+not, lower `neurons_per_culture` in config.py: the growth is per worker and proportional to the
+simulations it runs (1000 -> 42 jobs of ~3.5 h, half the memory; the launcher re-plans by
+itself). Fewer cores per job (`CULT_PER_JOB=24 CORES=24`) halves the memory per JOB but not per
+node: the jobs request no memory, so PBS may place two of them on one node. One culture per core
+bounds it; a worker killed for memory loses only the rest of its culture (every block is on
+disk) and the merge keeps its complete neurons.
+
+Monitor:
+
+```bash
+qstat -u $USER
+n=$(cat results_full_tuned/parts_ftd*/part_*.csv 2>/dev/null | wc -l); f=$(ls results_full_tuned/parts_ftd*/part_*.csv 2>/dev/null | wc -l); echo "$((n-f)) of 6048000 simulations on disk"
+grep "s/sim" logs/full_tuned_ftd01.log | tail -3        # per-worker speed, builds so far
+j=$(qselect -u $USER -N ftd01 -s R); [ -n "$j" ] && qstat -f $j | grep -E "resources_used.(mem|walltime)"
+```
+
+Analysis once every job has finished (or earlier on what is on disk -- it only reads):
+
+```bash
+qsub -v "PARTS=results_full_tuned/parts_ftd*,MAX_TASKS=8" jobs/analysis.pbs
+```
+
+For full_tuned the job adds the post-pulse bump statistics (`bump_statistics.pdf/.csv`, over every
+row of the merge) and example traces of the campaign's own neurons (`campaign_examples.pdf/.csv`,
+re-simulated with NEURON from the per-job merge of ftd01). PARTS is required for full_tuned:
+`results_full_tuned/` also holds the dry runs, ft1000 and the stopped ftc campaign (800 ms window,
++/-500 um, 1700 per culture), which must not be pooled with it. Sizes at 6 M rows: parts ~1.7 GB,
+each merged `culture_P*.csv` ~1.7 GB, each statistics task ~6.5 GB of memory (the kinetics columns
+are not read), a few minutes each; `MAX_TASKS` bounds how many run at once.
+
+Earlier campaigns keep working with the tools: the examples and the Vm movie regenerate a row's
+placement from (seed, culture) and try the current square first, then the one used before
+2026-09-28 (+/-500 um around (0, 0), 1700 per culture); a row is accepted only if a draw
+reproduces it exactly.
+
 ## Git: push (laptop) and pull (cluster)
 
 Laptop, in your clone of github.com/matig331/ElectricalSimulation (the tarball carries whole

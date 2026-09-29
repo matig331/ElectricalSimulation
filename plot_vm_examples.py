@@ -824,12 +824,16 @@ def load_campaign_rows(path):
 
 
 def draw_context(cfg):
-    """Exactly the geometry the campaign drivers pass to culture_draws (culture_worker.py)."""
+    """Exactly the geometry the campaign drivers pass to culture_draws (culture_worker.py).
+    `frames`: the soma squares to try when regenerating a row -- the current one first, then
+    the one of the campaigns before 2026-09-28 (culture_export.placement_frames)."""
     import field as F
-    from culture_export import electrode_center, dipole_axis_deg, dipole_frame
+    from culture_export import electrode_center, dipole_axis_deg, dipole_frame, placement_frames
     elec, sign = F.default_array(pitch_um=cfg.pitch_um, monopolar=not cfg.bipolar)
     dip_c, dip_d = dipole_frame(elec, sign)
-    return dict(span=cfg.span_half_um(), elec=elec, center=electrode_center(elec),
+    frames = placement_frames(cfg, elec, sign)
+    return dict(span=frames[0]["span"], place_center=frames[0]["center"], frames=frames,
+                elec=elec, center=electrode_center(elec),
                 axis=dipole_axis_deg(elec, sign), dip_c=dip_c, dip_d=dip_d,
                 morphs=list(cfg.morphologies), h_soma=cfg.h_soma_um)
 
@@ -843,6 +847,10 @@ def recover_placements(rows, cfg, n_per_culture=None):
     long as ONE culture of that seed finished; if the walltime cut EVERY culture short, the
     inferred N is too small, the check below fails for every row, and the rows are skipped
     (never mis-placed) -- the message then says to pass --neurons-per-culture.
+
+    Each row is tried against every frame of draw_context (the current soma square, then the
+    one of the earlier campaigns), so rows of both regenerate; a row is accepted only when a
+    frame reproduces it (morphology, x and y to 0.006 um, folded angle to 0.06 deg).
     """
     from collections import defaultdict
     from culture_export import culture_draws
@@ -859,27 +867,30 @@ def recover_placements(rows, cfg, n_per_culture=None):
         hit = None
         # 'culture' is the draw index in raw parts; culture_statistics' merged file keeps it as
         # 'local_culture' when it renumbers. Try both, keep whichever the row agrees with.
-        for key in ("culture", "local_culture"):
-            if key not in r or r[key] in ("", None):
-                continue
-            c = int(float(r[key]))
-            k = (seed, c)
-            if k not in cache:
-                cache[k] = culture_draws(seed, c, n_of[r["seed"]], len(ctx["morphs"]),
-                                         ctx["span"], ctx["elec"], ctx["center"],
-                                         ctx["dip_c"], ctx["dip_d"], ctx["axis"],
-                                         ctx["h_soma"])
-            d = cache[k]
-            if i >= len(d["midx"]):
-                continue
-            ok = (ctx["morphs"][int(d["midx"][i])] == r["morphology"]
-                  and abs(float(d["pos"][i, 0]) - _ff(r["x_um"])) < 0.006
-                  and abs(float(d["pos"][i, 1]) - _ff(r["y_um"])) < 0.006
-                  and abs(float(d["th_or"][i]) - _ff(r["theta_orient_deg"])) < 0.06)
-            if ok:
-                # the EXACT draw, not the row's x/y: those are rounded to 0.01 um, and on a
-                # soma ~100 um from the array that rounding alone moved DeltaV_end by 0.07 %
-                hit = (float(d["pos"][i, 0]), float(d["pos"][i, 1]), float(d["theta"][i]))
+        for fi, fr in enumerate(ctx["frames"]):
+            for key in ("culture", "local_culture"):
+                if key not in r or r[key] in ("", None):
+                    continue
+                c = int(float(r[key]))
+                k = (seed, c, fi)
+                if k not in cache:
+                    cache[k] = culture_draws(seed, c, n_of[r["seed"]], len(ctx["morphs"]),
+                                             fr["span"], ctx["elec"], ctx["center"],
+                                             ctx["dip_c"], ctx["dip_d"], ctx["axis"],
+                                             ctx["h_soma"], place_center=fr["center"])
+                d = cache[k]
+                if i >= len(d["midx"]):
+                    continue
+                ok = (ctx["morphs"][int(d["midx"][i])] == r["morphology"]
+                      and abs(float(d["pos"][i, 0]) - _ff(r["x_um"])) < 0.006
+                      and abs(float(d["pos"][i, 1]) - _ff(r["y_um"])) < 0.006
+                      and abs(float(d["th_or"][i]) - _ff(r["theta_orient_deg"])) < 0.06)
+                if ok:
+                    # the EXACT draw, not the row's x/y: those are rounded to 0.01 um, and on
+                    # a soma ~100 um from the array that rounding alone moved DeltaV_end 0.07 %
+                    hit = (float(d["pos"][i, 0]), float(d["pos"][i, 1]), float(d["theta"][i]))
+                    break
+            if hit is not None:
                 break
         if hit is None:
             skipped.append(r)
@@ -1013,6 +1024,11 @@ def campaign_check(rec, fit, row):
     campaign's 5 ms changes it by nothing at that precision. The bump numbers agree to ~1e-4
     mV / ~0.1 %; the tolerances below (1e-3 mV; 3 % peak, 5 % tau_decay) therefore catch a
     wrong neuron or a wrong window, not floating-point noise.
+
+    A soma caught MID-SPIKE at the end of phase 2 (|DeltaV_end| of tens of mV) amplifies the
+    one deliberate difference, the 100 ms baseline, to ~1e-3 mV (measured: 1.06e-3 mV on a
+    34.4 mV row), so DeltaV_end is compared to 1e-3 mV or 1e-3 of |DeltaV_end|, whichever is
+    larger. A wrong neuron differs by orders of magnitude more.
     """
     t, dv = rec["t_dv_fine"], rec["dv_fine"]
     dv_end = float(dv[int(np.argmin(np.abs(t)))]) if t.size else float("nan")
@@ -1023,7 +1039,8 @@ def campaign_check(rec, fit, row):
                row_state=state, ok_resim=int(b["fit_ok"]), ok_row=int(state == "accepted"),
                peak_resim=b["peak_mV"], peak_row=_ff(row.get("dexp_peak_mV")),
                tau_d_resim=b["tau_decay_ms"], tau_d_row=_ff(row.get("dexp_tau_decay_ms")))
-    agree = bool(out["d_dv_end"] < 1e-3)            # False for a nan difference as well
+    tol = max(1e-3, 1e-3 * abs(row_dv)) if np.isfinite(row_dv) else 1e-3
+    agree = bool(out["d_dv_end"] < tol)             # False for a nan difference as well
     if state != "unmeasured":
         # an unmeasured row has no fit to compare -- only DeltaV_end is checked for it
         agree = agree and out["ok_resim"] == out["ok_row"]

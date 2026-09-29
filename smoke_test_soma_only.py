@@ -266,10 +266,12 @@ try:
           all(abs(float(d["v_rest_mV"]) - V_REST_PREP) < 1e-3 for d in D))
     elec, sign = F.default_array(pitch_um=CFG.pitch_um, monopolar=not CFG.bipolar)
     dc, dd = CE.dipole_frame(elec, sign)
+    span, place_c = CE.placement_frame(CFG, elec, sign)      # the square the worker draws in
     ok = True
     for c in (0, 1):
-        dr = CE.culture_draws(1000, c, 3, 1, CFG.span_half_um(), elec, CE.electrode_center(elec),
-                              dc, dd, CE.dipole_axis_deg(elec, sign), CFG.h_soma_um)
+        dr = CE.culture_draws(1000, c, 3, 1, span, elec, CE.electrode_center(elec),
+                              dc, dd, CE.dipole_axis_deg(elec, sign), CFG.h_soma_um,
+                              place_center=place_c)
         for d in D:
             if int(d["culture"]) == c:
                 i = int(d["neuron"])

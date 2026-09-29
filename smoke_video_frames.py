@@ -160,12 +160,14 @@ def main():
     from config import CFG
     g = V._geometry(CFG)
     dd = CE.culture_draws(7, 1, 30, len(CFG.morphologies), 200.0, g["elec"], g["center"],
-                          g["dip"][0], g["dip"][1], g["axis"], CFG.h_soma_um)
+                          g["dip"][0], g["dip"][1], g["axis"], CFG.h_soma_um,
+                          place_center=g["place_center"])
     row = d[(d.culture == 1) & (d.neuron == 4)].iloc[0]
     import json
     man = json.load(open(os.path.join(ser, "video_manifest_S7.json")))
     ok &= report("4", rc == 0 and len(fr) == 2 and len(d) == 2 * 30 * 1 * nfr
                  and abs(row.x - round(dd["pos"][4, 0], 2)) < 1e-9
+                 and abs(row.y - round(dd["pos"][4, 1], 2)) < 1e-9
                  and abs(row.theta_deg - round(dd["theta"][4], 2)) < 1e-9
                  and man["max_abs_dv_end_diff_vs_campaign_mV"] == 0.0,
                  f"{len(fr)} files, {len(d)} rows (= 2x30x1x{nfr}), positions = culture_draws")

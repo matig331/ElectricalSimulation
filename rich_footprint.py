@@ -46,11 +46,35 @@ def _placed(cell, pos_xy, theta_deg):
     return p, refs
 
 
+# Play vectors REUSED by every spikes_at() call, whatever the cell. NEURON keeps ~96 bytes for
+# every hoc object ever created, freed or not (measured with NEURON 9.0.2, whatever the size),
+# and a simulation plays one vector per segment (~1250): creating them anew each call grew a
+# worker by ~0.15 MB per simulation, about half of all it grew (~0.3 MB, i.e. ~1.6 GB over a
+# 1700-neuron culture and ~80 GB on a 48-worker node).
+# Each call refills them in place with copy() + mul() -- measured leak-free, and the same doubles
+# h.Vector(g * I) holds (Vector.as_numpy() and from_python() both retain memory per call) --
+# attaches them with play() and detaches them with play_remove(), so no call can see another
+# call's stimulus.
+_PLAY_VECS = []
+
+
+def _play_vectors(n, length):
+    """n Vectors of `length` doubles from the shared pool (grown when needed, never shrunk)."""
+    while len(_PLAY_VECS) < n:
+        _PLAY_VECS.append(h.Vector())
+    out = _PLAY_VECS[:n]
+    for v in out:
+        if int(v.size()) != int(length):
+            v.resize(int(length))
+    return out
+
+
 def spikes_at(cell, pos_xy, theta_deg, i0_uA=50.0, phase_dur_ms=0.25,
               baseline_ms=5.0, post_ms=6.0, dt_ms=0.025,
               sigma_Sm=1.5, rmin_um=12.5, ramp_us=100.0, interphase_us=0.0, phase="both",
               detail=False, pre_end_ms=0.0, v_init_mV=V_REST,
-              bump_ms=0.0, bump_dt_ms=0.5, cvode_atol=1e-6, play_margin_ms=1.0):
+              bump_ms=0.0, bump_dt_ms=0.5, cvode_atol=1e-6, play_margin_ms=1.0,
+              pre_settle_ms=0.0):
     """Light: soma-only recording, short window. Returns (n_spikes, Vsoma_max).
     detail=True -> (n_spikes, Vsoma_max, tw, vw): the soma trace from `pre_end_ms` before the
     END of phase 2 onward, with tw = t - t_end (tw = 0 exactly at the end of phase 2).
@@ -78,51 +102,91 @@ def spikes_at(cell, pos_xy, theta_deg, i0_uA=50.0, phase_dur_ms=0.25,
     cvode_atol: 1e-6 keeps the fitted taus within ~0.05 ms of a fixed-dt reference (1e-4 costs
     ~15% less but drifts the decay tau by ~0.2 ms).
 
+    pre_settle_ms > 0: a longer rest before the pulse without paying for it at fixed dt. The
+    first pre_settle_ms are integrated at a VARIABLE step (CVODE) with the stimulus off, then
+    baseline_ms at the fixed dt_ms, then the pulse at t_on = pre_settle_ms + baseline_ms. The
+    cell starts at its own settled equilibrium, so CVODE crosses the interval in a few large
+    steps (measured on a full_tuned cell: 95 ms of it cost less than 1 s, against ~4 s at fixed
+    dt, with DeltaV_end within 2e-6 mV and the same bump fit). A stimulated run and its sham
+    take the SAME steps there (the field is 0 in both), so they still share the fixed-dt time
+    base from pre_settle_ms on and DeltaV is still a plain subtraction on it.
+    0 (default) = bit-identical to before.
+
     Returns (n_spikes, Vmax, tw, vw, tb, vb) when detail and bump_ms > 0, with tb rebased so
     t = 0 is the END of phase 2, like tw."""
     coords, refs = _placed(cell, pos_xy, theta_deg)
     elec, sign = F.default_array(monopolar=False)
     g = F.geom_factor(coords, elec, sign, sigma_Sm=sigma_Sm, rmin_um=rmin_um)
-    t_on = baseline_ms
+    T0 = max(0.0, float(pre_settle_ms or 0.0))     # end of the variable-step rest
+    t_on = T0 + baseline_ms
     post = post_ms      # detail=True must NOT lengthen the run (HPC cost)
     bump_ms = float(bump_ms or 0.0)
     t_end = t_on + 2 * phase_dur_ms                # END of the biphasic pulse (after phase 2)
     t_stop = t_end + (bump_ms if bump_ms > 0 else post)
-    # play grid: the whole window in the classic mode, the pulse only in bump mode
-    t = np.arange(0.0, (t_end + play_margin_ms if bump_ms > 0 else t_stop) + dt_ms, dt_ms)
+    # play grid, from the end of the variable-step rest: the whole window in the classic mode,
+    # the pulse only in bump mode
+    t_last = t_end + play_margin_ms if bump_ms > 0 else t_stop
+    t = T0 + np.arange(0.0, (t_last - T0) + dt_ms, dt_ms)
     I = F.biphasic_current(t - t_on, i0_uA, phase_dur_ms, True, ramp_us, interphase_us)  # ramped
     if phase != "both":                                    # deliver only phase 1 (+) or phase 2 (-)
         I = I * F.phase_mask(t, t_on, phase_dur_ms, phase, interphase_us)
-    tvec = h.Vector(t); keep = [tvec]
+    tvec = h.Vector(t)
     for sec in set(s.sec for s in refs):
         if not h.ismembrane("extracellular", sec=sec):
             sec.insert("extracellular")
-    for k, seg in enumerate(refs):
-        vv = h.Vector(g[k] * I); vv.play(seg._ref_e_extracellular, tvec, True); keep.append(vv)
+    unit = h.Vector(I)                             # the time course every segment shares
+    played = []
+    try:
+        for vv, gk, seg in zip(_play_vectors(len(refs), t.size), g, refs):
+            vv.copy(unit)
+            vv.mul(float(gk))                      # the same doubles h.Vector(gk * I) would hold
+            vv.play(seg._ref_e_extracellular, tvec, True)
+            played.append(vv)
+    except BaseException:
+        for vv in played:
+            vv.play_remove()
+        raise
     vs = h.Vector().record(cell.soma[0](0.5)._ref_v)
-    ts = h.Vector().record(h._ref_t) if (bump_ms > 0 and detail) else None
-    if bump_ms > 0:                                # fixed output grid for the bump fit
+    # solver times are needed whenever a variable-step stretch makes vs irregular
+    ts = h.Vector().record(h._ref_t) if (detail and (bump_ms > 0 or T0 > 0)) else None
+    if bump_ms > 0 or T0 > 0:                      # fixed output grid for the bump fit
+        # also created (and unused) in the short window when there is a variable-step rest: these
+        # Dt recorders make CVODE stop every bump_dt_ms, and the rest must take the SAME steps
+        # whatever the window, or DeltaV_end would depend on the window at the 1e-5 mV level
         vb = h.Vector(); vb.record(cell.soma[0](0.5)._ref_v, bump_dt_ms)
         tb = h.Vector(); tb.record(h._ref_t, bump_dt_ms)
     h.celsius = 37; h.dt = dt_ms; h.tstop = t_stop
     try:
         h.finitialize(float(v_init_mV))
+        if T0 > 0:                                 # rest, stimulus off: variable step
+            # tolerance BEFORE activation: CVODE sizes its first step when it is switched on,
+            # so with the order reversed the first call on a cell (the sham) would start from
+            # the default tolerance and every later call from atol -- different steps through
+            # the rest, and DeltaV_end = V - V_sham no longer exactly 0 at I = 0
+            h.cvode.atol(float(cvode_atol)); h.cvode_active(1)
+            h.continuerun(T0)
+            h.cvode_active(0); h.dt = dt_ms
         h.continuerun(t[-1])                       # through the pulse, fixed dt
         if bump_ms > 0:
-            for vv in keep[1:]:                    # stimulus is over: drop the play, zero the field
+            for vv in played:                      # stimulus is over: drop the play, zero the field
                 vv.play_remove()
+            played = []
             for seg in refs:
                 seg.e_extracellular = 0.0
             h.cvode_active(1); h.cvode.atol(float(cvode_atol))
             h.continuerun(t_stop)
     finally:
         h.cvode_active(0)                          # never leak the solver mode to the next call
+        for vv in played:                          # the pooled vectors must leave no play behind
+            vv.play_remove()
     v = np.asarray(vs)
     nsp = int(np.sum((v[:-1] < 0) & (v[1:] >= 0)))
     if detail:
-        t_rec = np.asarray(ts) if bump_ms > 0 else t
+        t_rec = np.asarray(ts) if ts is not None else t
         t_start = t_end - max(0.0, float(pre_end_ms))
-        m = t_rec >= t_start
+        # half a step of tolerance: the fixed-step clock accumulates rounding, and the sample AT
+        # t_start must not be lost to a -1e-12 (the neighbouring samples are a whole dt away)
+        m = t_rec >= t_start - 0.5 * dt_ms
         tw = (t_rec[m] - t_end).astype(float)      # t=0 is exactly END of phase 2
         vw = v[m].astype(float)
         if bump_ms > 0:

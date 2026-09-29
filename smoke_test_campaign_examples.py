@@ -14,7 +14,8 @@ which is where a silent error would put the wrong cell on a page with the right 
   [6] select_examples: counts, pools, distance spread, top-up, sort order, every mode
   [7] campaign_protocol: amplitude from the rows, mixed amplitudes refused, window default
   [8] load_campaign_rows: file, results directory, parts directory, missing column refused
-  [9] campaign_check: identical -> agrees; DeltaV_end or tau off -> differs; unmeasured row
+  [9] campaign_check: identical -> agrees; DeltaV_end or tau off -> differs; unmeasured row;
+       a mid-spike row within 1e-3 of |DeltaV_end| agrees
  [10] plot_gallery renders one page per `per_page` tiles
  [11] CLI: --from-csv with --fit joint is refused before anything is simulated
 
@@ -45,19 +46,21 @@ def check(cond, msg):
         FAILS.append(msg)
 
 
-def make_rows(seed, cultures, N, keep=None, rng_seed=0):
+def make_rows(seed, cultures, N, keep=None, rng_seed=0, frame=0):
     """Rows exactly as build_row would round them, for the placements culture_draws makes.
 
     Kinetics columns are synthetic: accepted / rejected / unmeasured in a fixed pattern.
+    frame: index into draw_context()["frames"] -- 0 the current soma square, -1 the legacy one.
     Returns (rows, truth) with truth[(seed, c, i)] = raw theta.
     """
     ctx = P.draw_context(CFG)
+    fr = ctx["frames"][frame]
     rng = np.random.default_rng(rng_seed)
     rows, truth = [], {}
     for c in cultures:
-        d = culture_draws(seed, c, N, len(ctx["morphs"]), ctx["span"], ctx["elec"],
+        d = culture_draws(seed, c, N, len(ctx["morphs"]), fr["span"], ctx["elec"],
                           ctx["center"], ctx["dip_c"], ctx["dip_d"], ctx["axis"],
-                          ctx["h_soma"])
+                          ctx["h_soma"], place_center=fr["center"])
         for i in range(N if keep is None else keep.get(c, N)):
             r = {k: "" for k in CSV_HEADER}
             r.update(culture=str(c), neuron=str(i), morphology=ctx["morphs"][int(d["midx"][i])],
@@ -98,6 +101,21 @@ check(all((p["x"], p["y"]) == truth[("pos", 2000, int(p["row"]["culture"]),
       "x/y are the exact draws, not the row's 0.01 um rounding")
 check(all(abs(p["x"] - float(p["row"]["x_um"])) <= 0.005 + 1e-9 for p in places),
       "... and agree with the row's x to its rounding")
+
+ctx0 = P.draw_context(CFG)
+fr0 = ctx0["frames"][0]
+xy = np.array([truth[("pos", 2000, c, i)] for c in (0, 1, 2) for i in range(20)])
+check(bool(np.all(np.abs(xy - fr0["center"]) <= fr0["span"] + 1e-9)),
+      "every soma inside the current square: +/-%g um around (%g, %g)"
+      % (fr0["span"], fr0["center"][0], fr0["center"][1]))
+if len(ctx0["frames"]) > 1:
+    rows_l, truth_l = make_rows(3000, [0, 1], 15, frame=-1)
+    pl_l, sk_l = P.recover_placements(rows_l, CFG)
+    check(len(pl_l) == 30 and not sk_l and all(
+        p["theta"] == truth_l[(3000, int(p["row"]["culture"]), int(p["row"]["neuron"]))]
+        for p in pl_l),
+        "rows of the earlier campaigns (+/-%g um around (0, 0)) still regenerate: %d / 30"
+        % (ctx0["frames"][-1]["span"], len(pl_l)))
 
 # ---------------------------------------------------------------------------------------------
 section("[2] corrupted rows are skipped, not re-placed")
@@ -264,6 +282,13 @@ check(c5["agrees"] == 1 and c5["row_state"] == "unmeasured",
       "unmeasured row -> only DeltaV_end compared")
 c6 = P.campaign_check(rec, {"bump": bump}, dict(row, deltaVm_end_phase2_mV=""))
 check(c6["agrees"] == 0, "missing DeltaV_end -> not counted as agreeing")
+spk = dict(t_dv_fine=t, dv_fine=np.where(t < 0, 1.0, 34.419706) * 1.0)
+c7 = P.campaign_check(spk, {"bump": dict(bump, fit_ok=0)},
+                      dict(row, deltaVm_end_phase2_mV="34.418649", dexp_fit_ok="0"))
+check(c7["agrees"] == 1, "mid-spike row (34.4 mV) off by 1.06e-3 mV -> agrees (1e-3 relative)")
+c8 = P.campaign_check(spk, {"bump": dict(bump, fit_ok=0)},
+                      dict(row, deltaVm_end_phase2_mV="34.2", dexp_fit_ok="0"))
+check(c8["agrees"] == 0, "mid-spike row off by 0.22 mV -> differs")
 
 # ---------------------------------------------------------------------------------------------
 section("[10] plot_gallery")

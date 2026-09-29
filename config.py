@@ -48,7 +48,8 @@ class WellConfig:
     # (field played over the pulse only, then CVODE) -- measured cost 2.6-2.9x per simulation,
     # against ~62x for a naive fixed-dt long window. bump_ms = 0 disables the kinetics
     # entirely and reproduces the short-window campaign exactly.
-    bump_ms: float = 800.0
+    # 1000 = one second recorded after the end of the pulse (campaigns before 2026-09-28: 800).
+    bump_ms: float = 1000.0
     bump_dt_ms: float = 0.5             # FIXED output grid for the bump fit (not solver steps,
                                         # which would quantise the time-to-peak)
     cvode_atol: float = 1e-6            # 1e-6 keeps the fitted taus within ~0.05 ms of a
@@ -74,6 +75,16 @@ class WellConfig:
     # subsampled -- the kinetics are a distribution, so a subsample is usually enough, and it
     # is unbiased in distance and orientation (unlike restricting the window by position).
     bump_culture_fraction: float = 1.0
+
+    # --- ONE stimulation per simulated neuron ---------------------------------
+    # Every simulation is: pre_stim_ms at rest (steady state), ONE biphasic pulse, bump_ms
+    # recorded after it; the row is written and the next neuron starts from a fresh
+    # initialisation -- no second pulse, ever. Of the pre_stim_ms, all but the last 5 ms are
+    # integrated at a VARIABLE step with the stimulus off: the cell starts at its own settled
+    # rest (leak-tuned, so a true equilibrium) and the solver crosses it in a few large steps.
+    # The last 5 ms, the pulse and play_margin_ms after it run at the fixed dt_ms, as before.
+    # 5.0 = no variable-step part = exactly the campaigns before 2026-09-28.
+    pre_stim_ms: float = 50.0
 
     # --- electrodes (3Brain HyperCAM / CorePlate) --------------------------
     pitch_um: float = 60.0
@@ -101,13 +112,28 @@ class WellConfig:
     # network_half_um = the area the HPC user actually simulates (the well, of order mm). None ->
     # fall back to area_half_um. This is what sets the biological neuron count on HPC.
     network_half_um: Optional[float] = 500
+    # placement_half_um = half-side of the square the somata are placed in (uniformly), centred
+    # on the dipole centre of the array (placement_centre "dipole"; "origin" = the point (0, 0)).
+    # 300 -> a 600 x 600 um square inside the 1 x 1 mm well: the region where the stimulus acts
+    # (activation footprint +/-180 um, |DeltaV_end| >= 0.5 mV out to ~250 um), instead of
+    # spending most simulations on far somata with micro-volt responses.
+    # None -> the rule of the campaigns before 2026-09-28: +/- max(network_half_um, area_half_um)
+    # around (0, 0) (culture_export.placement_frame(..., legacy=True) regenerates those).
+    placement_half_um: Optional[float] = 300.0
+    placement_centre: str = "dipole"
 
     # --- neuron count ------------------------------------------------------
     # n_neurons = somata per culture/well. THE 12 IS ARBITRARY, just for fast local tests.
     # On HPC set use_hpc_count=True and the count becomes biological automatically:
     #   N = density_per_mm2 x (2 * area / 1000)^2 ,  area = network_half_um (or area_half_um).
     n_neurons: int = 12
-    use_hpc_count: bool = True         # HPC: True -> n_neurons_effective() = n_neurons_hpc()
+    use_hpc_count: bool = True         # HPC: True -> n_neurons_effective() = neurons_per_culture
+    # neurons_per_culture = somata per culture on HPC, set directly. Neurons are simulated one at
+    # a time and never interact, so a culture is a bookkeeping unit -- one random realisation
+    # with its own seed, the unit of the culture-level error bars -- not a density. None -> the
+    # biological count n_neurons_hpc() of the whole well (1700 for 1 mm2 at 1700/mm2).
+    # jobs/launch_campaign.sh derives the number of jobs from it.
+    neurons_per_culture: Optional[int] = 2000
     h_soma_um: float = 10.0
     seed: int = 0
 
@@ -163,7 +189,8 @@ class WellConfig:
     # --- stimulation DURATION (statistics over >= 1 min) --------------------
     # The lab delivers 3 min at 0.2 Hz. For the per-culture statistic the reviewer wants
     # >= 1 min delivered. Duration -> number of pulses via the frequency.
-    stim_duration_s: float = 10.0  # total stimulation epoch (s); lab = 180 s (3 min).
+    stim_duration_s: float = 5.0   # total stimulation epoch (s); lab = 180 s (3 min).
+    #   5 s at 0.2 Hz = ONE pulse, so the n_pulses column says 1 -- what is simulated.
     #   Annotation only: sets the n_pulses CSV column (180 s x 0.2 Hz = 36); the simulation
     #   itself is ONE pulse either way (pulses at 0.2 Hz are independent).
 
@@ -207,15 +234,27 @@ class WellConfig:
         return int(round(self.density_per_mm2 * area_mm2))
 
     def n_neurons_effective(self) -> int:
-        """The count culture_export / phase_split actually use: n_neurons_hpc() when use_hpc_count
-        is True (HPC), else the hand-set n_neurons (local test)."""
-        return self.n_neurons_hpc() if self.use_hpc_count else int(self.n_neurons)
+        """The count culture_export / phase_split actually use. HPC (use_hpc_count True):
+        neurons_per_culture when set, else the biological n_neurons_hpc(). Local tests: the
+        hand-set n_neurons."""
+        if not self.use_hpc_count:
+            return int(self.n_neurons)
+        if self.neurons_per_culture is not None:
+            return int(self.neurons_per_culture)
+        return self.n_neurons_hpc()
 
-    def span_half_um(self) -> float:
-        """Sampling half-extent for culture_export: the network area if chosen, else the measured
-        footprint (never smaller than the footprint)."""
+    def legacy_span_half_um(self) -> float:
+        """The soma square of the campaigns before 2026-09-28: the network area, never smaller
+        than the measured footprint, around (0, 0)."""
         base = self.area_half_um if self.network_half_um is None else float(self.network_half_um)
         return max(float(base), float(self.area_half_um))
+
+    def span_half_um(self) -> float:
+        """Half-side of the square the somata are placed in: placement_half_um when set (around
+        the centre culture_export.placement_frame computes), else the legacy rule."""
+        if self.placement_half_um is not None:
+            return float(self.placement_half_um)
+        return self.legacy_span_half_um()
 
 
 CFG = WellConfig()

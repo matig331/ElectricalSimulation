@@ -743,21 +743,80 @@ class OutcomeWriter(object):
         return False
 
 
-def culture_draws(seed, c, N, n_morph, span, elec, center, dip_c, dip_d, axis_deg, h_soma_um):
+def culture_draws(seed, c, N, n_morph, span, elec, center, dip_c, dip_d, axis_deg, h_soma_um,
+                  place_center=None):
     """Placement of culture c. rng = default_rng(seed + c): the draws depend ONLY on (seed, c),
     never on which cultures ran before -- this is what makes the parallel split exact. The draw
     ORDER (morphology shuffle, positions, orientations) is the one every earlier version used,
     so a given (seed, c) places the somata exactly where the full-active campaign placed them.
+    Somata are uniform in the square of half-side `span` around `place_center` (None = (0, 0),
+    the convention before 2026-09-28; placement_frame() gives the current one). The centre is
+    added AFTER the draw, so the random stream is the same either way.
     Returns a dict of per-neuron arrays."""
     rng = np.random.default_rng(int(seed) + int(c))
     midx = assign_morphologies(int(N), int(n_morph), rng)
     pos = rng.uniform(-span, span, size=(int(N), 2))
+    if place_center is not None:
+        pos = pos + np.asarray(place_center, float).reshape(1, 2)
     theta = rng.uniform(0, 360, size=int(N))
     r_dip, th_pos = directional_rt(pos, dip_c, dip_d, z_um=h_soma_um)
     return dict(midx=midx, pos=pos, theta=theta,
                 d_near=dist_from_nearest_electrode(pos, elec),
                 d_cen=dist_from_center(pos, center),
                 r_dip=r_dip, th_pos=th_pos, th_or=rel_orientation_deg(theta, axis_deg))
+
+
+def placement_frame(cfg, elec_xy, sign, legacy=False):
+    """(half_side_um, centre_xy) of the square the somata of a culture are drawn in.
+
+    config.placement_half_um around the dipole centre of the array (placement_centre "dipole")
+    or around (0, 0) ("origin"). legacy=True -- or placement_half_um None -- is the rule of the
+    campaigns before 2026-09-28: +/- max(network_half_um, area_half_um) around (0, 0)."""
+    if legacy or getattr(cfg, "placement_half_um", None) is None:
+        return float(cfg.legacy_span_half_um()), np.zeros(2)
+    mode = str(getattr(cfg, "placement_centre", "dipole"))
+    if mode == "dipole":
+        c = np.asarray(dipole_frame(elec_xy, sign)[0], float)
+    elif mode == "origin":
+        c = np.zeros(2)
+    else:
+        raise ValueError("placement_centre must be 'dipole' or 'origin', got %r" % mode)
+    return float(cfg.placement_half_um), c
+
+
+def placement_frames(cfg, elec_xy, sign):
+    """The frames a tool that REGENERATES placements from (seed, culture) should try: the
+    current one, then the legacy one when it differs -- so rows of the earlier campaigns still
+    match their draws. A row is accepted only if a frame reproduces it exactly, so trying two
+    cannot mis-place a soma."""
+    span, cen = placement_frame(cfg, elec_xy, sign)
+    frames = [dict(span=span, center=cen, legacy=False)]
+    lspan, lcen = placement_frame(cfg, elec_xy, sign, legacy=True)
+    if lspan != span or not np.allclose(lcen, cen):
+        frames.append(dict(span=lspan, center=lcen, legacy=True))
+    return frames
+
+
+FIXED_PRE_MS = 5.0     # fixed-dt rest right before the pulse (rich_footprint.spikes_at baseline)
+
+
+def pre_stim_split(cfg):
+    """(baseline_ms, pre_settle_ms) for rich_footprint.spikes_at, from config.pre_stim_ms: the
+    last FIXED_PRE_MS before the pulse at the fixed dt, the rest at a variable step. Refuses a
+    rest that would put the end of phase 2 off the bump_dt_ms output grid: the bump fit is
+    anchored on the grid sample AT the end of phase 2."""
+    pre = float(getattr(cfg, "pre_stim_ms", FIXED_PRE_MS))
+    if not pre > 0:
+        raise ValueError("pre_stim_ms must be > 0, got %r" % pre)
+    base = min(FIXED_PRE_MS, pre)
+    t_end = pre + 2.0 * float(getattr(cfg, "phase_dur_ms", 0.25))
+    step = float(getattr(cfg, "bump_dt_ms", 0.5))
+    k = t_end / step
+    if abs(k - round(k)) > 1e-9:
+        raise ValueError("pre_stim_ms = %g puts the end of phase 2 at %g ms, not on the %g ms "
+                         "output grid of the bump fit; choose a multiple of %g minus the pulse"
+                         % (pre, t_end, step, step))
+    return base, pre - base
 
 
 # --------------------------------- NEURON-BACKED SHARED CORE --------------------------------- #
@@ -834,14 +893,17 @@ def _rest_and_sham(cell, cell_model, cfg, morph, layer, rest_tstop_ms=1500.0):
     leak = apply_model_state(cell, cell_model, cfg, v_rest)
 
     bump_ms = float(getattr(cfg, "bump_ms", 0.0) or 0.0)
+    base_ms, settle_ms = pre_stim_split(cfg)
     kin = dict(bump_ms=bump_ms, bump_dt_ms=float(getattr(cfg, "bump_dt_ms", 0.5)),
                cvode_atol=float(getattr(cfg, "cvode_atol", 1e-6)),
                play_margin_ms=float(getattr(cfg, "play_margin_ms", 1.0)),
                t0_ms=float(getattr(cfg, "bump_t0_ms", 0.0)),
-               early_floor=float(getattr(cfg, "bump_early_floor", 0.25)))
+               early_floor=float(getattr(cfg, "bump_early_floor", 0.25)),
+               baseline_ms=base_ms, pre_settle_ms=settle_ms)
     out = spikes_at(cell, (0.0, 0.0), 0.0, i0_uA=0.0, detail=True, pre_end_ms=0.0,
                     v_init_mV=v_rest, bump_ms=bump_ms, bump_dt_ms=kin["bump_dt_ms"],
-                    cvode_atol=kin["cvode_atol"], play_margin_ms=kin["play_margin_ms"])
+                    cvode_atol=kin["cvode_atol"], play_margin_ms=kin["play_margin_ms"],
+                    baseline_ms=base_ms, pre_settle_ms=settle_ms)
     n0, _vmax0, tw0, vw0 = out[0], out[1], out[2], out[3]
     if n0 > 0:
         raise RuntimeError("%s L%d (%s): the cell spikes with ZERO stimulus -- the rest state "
@@ -907,7 +969,9 @@ def simulate_neuron(prep, pos_xy, theta_deg, i0_uA, with_kinetics=True):
                     v_init_mV=prep["v_rest"], bump_ms=bump_ms,
                     bump_dt_ms=float(kin.get("bump_dt_ms", 0.5)),
                     cvode_atol=float(kin.get("cvode_atol", 1e-6)),
-                    play_margin_ms=float(kin.get("play_margin_ms", 1.0)))
+                    play_margin_ms=float(kin.get("play_margin_ms", 1.0)),
+                    baseline_ms=float(kin.get("baseline_ms", FIXED_PRE_MS)),
+                    pre_settle_ms=float(kin.get("pre_settle_ms", 0.0)))
     nsp, tw, vw = out[0], out[2], out[3]
     dv_end = v_at_end_of_phase2(tw, vw) - prep["v_sham_end"]
     label, act, depo, hypo = phase2_end_outcome(int(nsp > 0), dv_end)
@@ -1127,7 +1191,6 @@ def culture_export(n_cultures=None, neurons_per_culture=None, layers=None,
     seed_used = cfg.seed if seed is None else int(seed)
     N = cfg.n_neurons_effective() if neurons_per_culture is None else int(neurons_per_culture)
     layers = layers or cfg.layers_um
-    span = cfg.span_half_um() if span_um is None else float(span_um)
     i0 = cfg.i0_uA if i0_uA is None else float(i0_uA)
     cell_model = resolve_cell_model(cfg)
     n_pulses = cfg.n_pulses_for_duration()
@@ -1137,6 +1200,8 @@ def culture_export(n_cultures=None, neurons_per_culture=None, layers=None,
     center = electrode_center(elec)
     axis = dipole_axis_deg(elec, sign)
     dip_c, dip_d = dipole_frame(elec, sign)
+    span, place_c = placement_frame(cfg, elec, sign)
+    span = span if span_um is None else float(span_um)
 
     print(f"[culture_export SERIAL | {cell_model}] {n_cultures} cultures x {N} neurons x "
           f"{len(layers)} layers = {n_cultures * N * len(layers)} sims @ {i0:.0f} uA | "
@@ -1156,7 +1221,7 @@ def culture_export(n_cultures=None, neurons_per_culture=None, layers=None,
         with OutcomeWriter(CSV_HEADER, act_path) as ow:
             for c in range(n_cultures):
                 d = culture_draws(seed_used, c, N, M, span, elec, center, dip_c, dip_d, axis,
-                                  cfg.h_soma_um)
+                                  cfg.h_soma_um, place_center=place_c)
                 wk = culture_has_kinetics(seed_used, c,
                                           getattr(cfg, "bump_culture_fraction", 1.0))
                 for rows, _n_done in iter_culture_blocks(pool, c, d, morphs, layers, i0,
@@ -1172,8 +1237,11 @@ def culture_export(n_cultures=None, neurons_per_culture=None, layers=None,
 
     if make_figures and plot:
         prefix = os.path.basename(act_path).split("Pactivation")[0]
-        pdfs = render_outcome_set(np.asarray(plot, dtype=float), os.path.dirname(act_path),
-                                  prefix, span, bin_um, i0, n_pulses, cfg, elec, sign)
+        arr = np.asarray(plot, dtype=float)
+        # extent from the data, as culture_merge draws it: the square is off-centre by place_c
+        fig_span = float(max(np.abs(arr[:, 1]).max(), np.abs(arr[:, 2]).max()))
+        pdfs = render_outcome_set(arr, os.path.dirname(act_path),
+                                  prefix, fig_span, bin_um, i0, n_pulses, cfg, elec, sign)
         for pdf in pdfs.values():
             print("done PDF:", pdf)
     return paths["activation"], paths["depolarization"], paths["hyperpolarization"]

@@ -24,7 +24,7 @@
 #                    48 cores uses 10 of them. The job prints the utilisation and warns.
 #   SEED=2000        RNG base. Use a seed no earlier job used, or the placements repeat.
 #   LAYERS=          comma-separated slice thicknesses; default config.layers_um (40,80,120).
-#   BUMP_MS=800      post-pulse window. 0 = no kinetics, and the run costs ~3x less.
+#   BUMP_MS=         post-pulse window (default config.bump_ms). 0 = no kinetics, ~3x cheaper.
 #   BUMP_FRACTION=1  fraction of CULTURES measured for kinetics (config.bump_culture_fraction).
 #   DV_THRESHOLDS=0.5:1:2   |DeltaV_end| thresholds for the depol/hyperpol statistics.
 #   NAME=            tag for the parts dir and the outputs; default ft<NEURONS>_<date>.
@@ -72,7 +72,7 @@ NEURONS="${NEURONS:-1000}"
 CONC_EARLY="${PBS_NUM_PPN:-${PBS_NP:-$(nproc)}}"
 CULTURES="${CULTURES:-$CONC_EARLY}"      # one culture per core by default: see the note above
 SEED="${SEED:-2000}"
-BUMP_MS="${BUMP_MS:-800}"
+BUMP_MS="${BUMP_MS:-$(python -c 'from config import CFG; print(CFG.bump_ms)' 2>/dev/null)}"
 BUMP_FRACTION="${BUMP_FRACTION:-1.0}"
 DV_THRESHOLDS="${DV_THRESHOLDS:-0.5:1:2}"
 NAME="${NAME:-ft${NEURONS}_$(date +%Y%m%d_%H%M)}"

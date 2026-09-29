@@ -103,7 +103,7 @@ def run_worker(culture_ids, out_csv, neurons_per_culture=None, layers=None,
     from config import CFG
     from culture_export import (CellPool, culture_draws, culture_has_kinetics,
                                 iter_culture_blocks, resolve_cell_model, electrode_center,
-                                dipole_axis_deg, dipole_frame)
+                                dipole_axis_deg, dipole_frame, placement_frame, pre_stim_split)
     import field as F
 
     cfg = CFG
@@ -114,7 +114,6 @@ def run_worker(culture_ids, out_csv, neurons_per_culture=None, layers=None,
     cell_model = resolve_cell_model(cfg)
     N = cfg.n_neurons_effective() if neurons_per_culture is None else int(neurons_per_culture)
     layers = list(layers or cfg.layers_um)
-    span = cfg.span_half_um() if span_um is None else float(span_um)
     i0 = cfg.i0_uA if i0_uA is None else float(i0_uA)
     n_pulses = cfg.n_pulses_for_duration()
     morphs = cfg.morphologies
@@ -124,6 +123,9 @@ def run_worker(culture_ids, out_csv, neurons_per_culture=None, layers=None,
     center = electrode_center(elec)
     axis = dipole_axis_deg(elec, sign)
     dip_c, dip_d = dipole_frame(elec, sign)
+    span, place_c = placement_frame(cfg, elec, sign)
+    span = span if span_um is None else float(span_um)
+    base_ms, settle_ms = pre_stim_split(cfg)
     pid = os.getpid()
 
     if not quiet:
@@ -132,6 +134,10 @@ def run_worker(culture_ids, out_csv, neurons_per_culture=None, layers=None,
               "@ %.0f uA | block/flush every %d neurons"
               % (pid, cell_model, seed_used, culture_ids, N, len(layers), n_sim, i0,
                  flush_every), flush=True)
+        print("[worker pid=%d] somata in +/-%g um around (%g, %g) um | one pulse per neuron: "
+              "%g ms rest (%g variable-step + %g fixed-dt), pulse, %g ms after"
+              % (pid, span, place_c[0], place_c[1], settle_ms + base_ms, settle_ms, base_ms,
+                 float(getattr(cfg, "bump_ms", 0.0) or 0.0)), flush=True)
 
     d_out = os.path.dirname(os.path.abspath(out_csv))
     if d_out and not os.path.isdir(d_out):
@@ -153,7 +159,7 @@ def run_worker(culture_ids, out_csv, neurons_per_culture=None, layers=None,
             os.fsync(fh.fileno())
             for c in culture_ids:
                 d = culture_draws(seed_used, c, N, M, span, elec, center, dip_c, dip_d, axis,
-                                  cfg.h_soma_um)
+                                  cfg.h_soma_um, place_center=place_c)
                 t0 = time.time()
                 # the long post-pulse window on a (seed, culture)-determined subsample of
                 # cultures (config.bump_culture_fraction). This line was missing: the serial

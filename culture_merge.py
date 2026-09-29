@@ -61,7 +61,7 @@ SCHEMAS = {tuple(CSV_HEADER): "current",
 # LEGACY_CSV_HEADER is a prefix of CSV_HEADER, so these indices hold for BOTH schemas
 _CULTURE, _NEURON, _LAYER, _I0, _PULSES, _SEED = (
     CSV_HEADER.index(k) for k in ("culture", "neuron", "layer_um", "i0_uA", "n_pulses", "seed"))
-_MODEL = CSV_HEADER.index("cell_model")          # current schema only
+_MODEL = CSV_HEADER.index("cell_model")          # same index in every schema that has it
 
 
 class Scan(object):
@@ -168,7 +168,7 @@ def scan_parts(part_files, expect_model=None):
             s.mask[key] = m | bit
             s.i0.add(r[_I0])
             s.pulses.add(r[_PULSES])
-            if s.schema == "current":
+            if "cell_model" in s.header:
                 s.models.add(r[_MODEL])
             n_here += 1
         if key is not None:
@@ -183,7 +183,11 @@ def scan_parts(part_files, expect_model=None):
                  seeds, len(cults), (" %d..%d" % (cults[0], cults[-1])) if cults else ""))
     if s.schema is None:
         raise SystemExit("every part is empty -- nothing to merge")
-    if s.schema == "current":
+    # Every schema since the soma_only campaign records the model in each row: read it. Only
+    # the legacy full-active parts (no cell_model column) are full_active by definition. (This
+    # used to test schema == "current", so once the kinetics columns made the 46-column schema
+    # "current", the 22-column soma_only parts were labelled full_active and refused.)
+    if "cell_model" in s.header:
         if len(s.models) != 1:
             raise SystemExit("parts mix cell models %s -- never pool models; merge each model's "
                              "parts separately" % sorted(s.models))

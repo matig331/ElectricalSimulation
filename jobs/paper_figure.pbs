@@ -18,7 +18,7 @@
 #   FROM_EXAMPLES=...  plot_vm_examples.csv or campaign_examples.csv   (with EXAMPLE=N)
 #   PLACEMENT=...      morph:layer:x:y:theta  (used when FROM_EXAMPLES is not given)
 #   MODEL=full_tuned   cell model
-#   BUMP_MS=800        post-pulse window drawn and fitted
+#   BUMP_MS=           post-pulse window drawn and fitted (default config.bump_ms)
 #   OUT=figures/fig_readouts   output stem -> .pdf .svg .png .npz _values.txt
 #   WIDTH_MM=180       figure width (double column); the layout scales with it
 #
@@ -51,7 +51,7 @@ else
 fi
 
 MODEL="${MODEL:-full_tuned}"
-BUMP_MS="${BUMP_MS:-800}"
+BUMP_MS="${BUMP_MS:-$(python -c 'from config import CFG; print(CFG.bump_ms)' 2>/dev/null)}"
 OUT="${OUT:-figures/fig_readouts}"
 WIDTH_MM="${WIDTH_MM:-180}"
 mkdir -p "$(dirname "$OUT")"
