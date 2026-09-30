@@ -8,7 +8,7 @@
 #   bash jobs/merge_all.sh                  # model = config.cell_model
 #   MODEL=full_active bash jobs/merge_all.sh
 #   bash jobs/merge_all.sh --no-figures     # CSVs only (faster)
-#   PARTS='results_full_tuned/parts_ftc*' bash jobs/merge_all.sh --no-figures
+#   PARTS='results_full_tuned/parts_ftd*' bash jobs/merge_all.sh --no-figures
 #
 # Env: MODEL = cell model (default config.cell_model)
 #      PARTS = glob of the parts directories to merge (QUOTE it). Default
@@ -39,7 +39,7 @@ esac
 
 if [ -z "${PARTS:-}" ] && [ "$MODEL" = "full_tuned" ]; then
     echo "FATAL: for full_tuned give the campaign's parts explicitly, e.g." >&2
-    echo "         PARTS='results_full_tuned/parts_ftc*' bash jobs/merge_all.sh" >&2
+    echo "         PARTS='results_full_tuned/parts_ftd*' bash jobs/merge_all.sh" >&2
     echo "       results_full_tuned/ also holds test runs that must not be pooled with it:" >&2
     for d in results_full_tuned/parts_*/; do
         [ -d "$d" ] && echo "         $d" >&2

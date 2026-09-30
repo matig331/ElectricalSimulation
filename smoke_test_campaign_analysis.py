@@ -16,7 +16,9 @@ that nothing it computes changed.
      equals a direct numpy computation and does not depend on how many points are drawn
   6  culture_statistics: the kinetics columns are no longer read, every statistic is identical;
      culture_merge reads the model of the 22-column soma_only parts again (it had labelled
-     them full_active since the kinetics columns were added, and refused to merge them)
+     them full_active since the kinetics columns were added, and refused to merge them);
+     culture_merge on parts that grow between its two passes (jobs still running) merges the
+     first pass's snapshot instead of failing with a KeyError
   7  jobs/merge_all.sh and jobs/analysis.pbs refuse a full_tuned merge without PARTS, and
      merge_all.sh merges exactly the directories PARTS matches
   8  pure ASCII, LF line endings in every file of this delivery
@@ -337,6 +339,40 @@ def test_merge_models(tmp):
         check(True, "soma_only parts refused under --expect-model full_tuned")
 
 
+def test_merge_growing(tmp):
+    print("6c culture_merge while jobs still write: both passes read the same bytes")
+    import culture_merge
+    from synthetic_campaign import culture_rows
+    d = os.path.join(tmp, "parts_grow")
+    write_parts(d, n_cultures=2, n_neurons=20, seed=62000, n_workers=2)
+    ref = os.path.join(tmp, "merged_grow_ref")
+    culture_merge.merge(d, ref, make_figures=False, expect_model="full_tuned")
+    orig = culture_merge.scan_parts
+
+    def scan_then_grow(files, expect_model=None):
+        s = orig(files, expect_model)
+        # a running worker appends its next neuron, then starts another row, between the passes
+        with open(os.path.join(d, "part_001.csv"), "a", newline="") as fh:
+            csv.writer(fh).writerows(culture_rows(62000, 1, 21)[-3:])
+            fh.write("62000,1,99")
+        return s
+    culture_merge.scan_parts = scan_then_grow
+    try:
+        culture_merge.merge(d, os.path.join(tmp, "merged_grow"), make_figures=False,
+                            expect_model="full_tuned")
+        got = None
+    except (KeyError, SystemExit) as exc:
+        got = "%s: %s" % (type(exc).__name__, exc)
+    finally:
+        culture_merge.scan_parts = orig
+    same = got is None and all(
+        open(os.path.join(ref, f)).read() == open(os.path.join(tmp, "merged_grow", f)).read()
+        for f in ("culture_Pactivation.csv", "culture_Pdepolarization.csv",
+                  "culture_Phyperpolarization.csv"))
+    check(same, "a part growing between the passes: merged = the pass-1 snapshot, "
+          "identical to merging before the growth%s" % ("" if got is None else " -- " + got))
+
+
 def test_job_guards(tmp):
     print("7  merge_all.sh / analysis.pbs: full_tuned needs PARTS; PARTS selects exactly")
     repo = os.path.join(tmp, "repo")
@@ -376,7 +412,7 @@ def test_job_guards(tmp):
           "PARTS='...parts_ftc*' merges the 2 campaign jobs only (%d rows)" % n_rows)
     r = subprocess.run(["bash", "jobs/analysis.pbs"], cwd=repo, env=env, capture_output=True,
                        text=True)
-    check(r.returncode != 0 and "PARTS=results_full_tuned/parts_ftc" in r.stderr,
+    check(r.returncode != 0 and "PARTS=results_full_tuned/parts_ftd" in r.stderr,
           "analysis.pbs without PARTS or MERGED refuses")
 
 
@@ -428,6 +464,7 @@ def main():
         test_main(tmp)
         test_statistics(tmp)
         test_merge_models(tmp)
+        test_merge_growing(tmp)
         test_job_guards(tmp)
         test_ascii()
         if "--big" in sys.argv:

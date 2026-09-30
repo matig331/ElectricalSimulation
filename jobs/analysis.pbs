@@ -20,7 +20,7 @@
 # Submit from the pipeline folder:   qsub jobs/analysis.pbs
 # Options, comma-separated:          qsub -v DEDUPE=1,MOVIE=0 jobs/analysis.pbs
 # The full_tuned campaign (quote the glob):
-#   qsub -v "PARTS=results_full_tuned/parts_ftc*" jobs/analysis.pbs
+#   qsub -v "PARTS=results_full_tuned/parts_ftd*" jobs/analysis.pbs
 #   PARTS=...    parts folders to merge      (default: results_<cell_model>/parts_*; REQUIRED
 #                for full_tuned unless MERGED is given: results_full_tuned/ also holds test
 #                runs -- dry runs, ft1000_* -- that must not be pooled with a campaign)
@@ -66,7 +66,7 @@ source jobs/results_layout.sh
 MODEL="${MODEL:-$(cfg_cell_model)}"
 if [ "$MODEL" = "full_tuned" ] && [ -z "${PARTS:-}" ] && [ -z "${MERGED:-}" ]; then
     echo "FATAL: for full_tuned give the campaign's parts, e.g." >&2
-    echo "         qsub -v \"PARTS=results_full_tuned/parts_ftc*\" jobs/analysis.pbs" >&2
+    echo "         qsub -v \"PARTS=results_full_tuned/parts_ftd*\" jobs/analysis.pbs" >&2
     echo "       results_full_tuned/ also holds test runs that must not be pooled with it:" >&2
     for d in results_full_tuned/parts_*/; do [ -d "$d" ] && echo "         $d" >&2; done
     exit 1

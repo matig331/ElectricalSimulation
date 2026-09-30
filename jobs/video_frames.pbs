@@ -1,10 +1,21 @@
 #!/bin/bash
 # jobs/video_frames.pbs -- data + the three stimulation videos, on ONE node, all cores.
 #
-#   qsub jobs/video_frames.pbs                                   # defaults below
+#   qsub -v JOB=ftd01,TMAX=1000 jobs/video_frames.pbs        # cultures 0-4 OF CAMPAIGN JOB ftd01
+#   qsub jobs/video_frames.pbs                                # config's seed, culture size, square
 #   qsub -v N_CULTURES=5,NEURONS=1700,SPAN=571.75,LAYERS=80,TMAX=200 jobs/video_frames.pbs
-#   qsub -v MODEL=soma_only jobs/video_frames.pbs                 # another cell model
-#   qsub -v RENDER=0 jobs/video_frames.pbs                        # data only, render later
+#   qsub -v MODEL=soma_only jobs/video_frames.pbs             # another cell model
+#   qsub -v RENDER=0 jobs/video_frames.pbs                    # data only, render later
+#
+# JOB=<campaign job> (e.g. ftd01) makes the videos from THAT job's cultures: its seed is read
+# from results_<model>/parts_<JOB>/, the culture size and soma square are config's (the ones
+# the campaign used), and two checks bracket the simulation:
+#   before: the placements of the chosen cultures are regenerated (numpy, seconds) and compared
+#           with the campaign's rows -- a wrong culture size, square or seed stops the job here;
+#   after : every simulated neuron x layer is compared with its campaign row (specimen, soma
+#           position, fired, DeltaV_end to 2e-6 mV) -- the job renders only if all agree.
+# Pick a FINISHED job (ftd01-ftd12 on 2026-09-30); ALLOW_MISSING=1 accepts neurons a running
+# job has not written yet.
 #
 # Step 1  video_frames.py: every neuron x layer of every culture, DeltaV(t) vs sham on the frame
 #         grid, in parallel (one live cell per worker). Stops if DeltaV_end differs from the
@@ -12,8 +23,8 @@
 # Step 2  (RENDER=1) make_prob_videos.py: video 1 (all cultures, probability)
 #         make_culture_videos.py: videos 2 and 3 (cultures CULTURE_IDS, one layer)
 #
-# Cost: ~20 s per neuron x layer at an 800 ms window (jobs/vm_examples.pbs); 200 ms is cheaper.
-# 5 cultures x 1700 x 1 layer = 8500 sims -> ~1.5 h on 32 cores at the 800-ms bound.
+# Cost: ~8 s per neuron x layer at the campaign's 1000 ms window with every core busy (measured
+# on the ftd campaign); 5 cultures x 2000 x 1 layer = 10000 sims -> ~45 min on 32 cores.
 #PBS -N estim_video_frames
 #PBS -l nodes=1:ppn=32
 #PBS -l walltime=04:00:00
@@ -38,25 +49,25 @@ if [ -f jobs/env_setup.sh ]; then
 else
     echo "NOTE: jobs/env_setup.sh absent -- relying on the ambient environment"
 fi
+source jobs/results_layout.sh
 
 # ------------------------------------------------------------------ parameters (qsub -v ...)
 MODEL="${MODEL:-}"                 # empty -> config.cell_model
+JOB="${JOB:-}"                     # a campaign job, e.g. ftd01: ITS cultures (see above)
 N_CULTURES="${N_CULTURES:-5}"
 FIRST="${FIRST:-0}"                # cultures FIRST .. FIRST+N_CULTURES-1
-NEURONS="${NEURONS:-1700}"         # per culture
-SPAN="${SPAN:-571.75}"             # half-side of the soma square (um); 1700 at 1300/mm^2
+NEURONS="${NEURONS:-}"             # per culture; empty -> config (the campaign's)
+SPAN="${SPAN:-}"                   # half-side of the soma square (um); empty -> config
 LAYERS="${LAYERS:-80}"             # e.g. 80  or  40,80,120
-TMAX="${TMAX:-200}"                # ms after the pulse
-SEED="${SEED:-}"                   # empty -> config.seed
+TMAX="${TMAX:-200}"                # ms after the pulse (the campaign records 1000)
+SEED="${SEED:-}"                   # empty -> config.seed, or JOB's seed
 CHUNK="${CHUNK:-50}"               # neurons per task
 RENDER="${RENDER:-1}"
 CULTURE_IDS="${CULTURE_IDS:-0 1}"  # the two cultures of videos 2-3 (ids from --list)
-HALF="${HALF:-600}"                # map half-width in the videos (um)
+HALF="${HALF:-}"                   # map half-width in the videos (um); empty -> square + 20 um
 SIGMA="${SIGMA:-20}"               # smoothing of video 1 (um)
-TAG="${MODEL:-cfg}"
-OUT="${OUT:-video_run_${TAG}_$(date +%Y%m%d_%H%M)}"
+ALLOW_MISSING="${ALLOW_MISSING:-0}"
 NPROC="${PBS_NUM_PPN:-${PBS_NP:-$(nproc)}}"
-mkdir -p "$OUT"
 
 # ------------------------------------------------------------------ prerequisites
 python - <<'PY'
@@ -65,7 +76,8 @@ missing = []
 try:
     import rich_footprint
     p = inspect.signature(rich_footprint.spikes_at).parameters
-    for a in ("bump_ms", "bump_dt_ms", "cvode_atol", "play_margin_ms", "pre_end_ms", "detail"):
+    for a in ("bump_ms", "bump_dt_ms", "cvode_atol", "play_margin_ms", "pre_end_ms", "detail",
+              "pre_settle_ms"):
         if a not in p:
             missing.append("rich_footprint.spikes_at(%s=...)" % a)
 except Exception as exc:
@@ -73,7 +85,7 @@ except Exception as exc:
 try:
     import culture_export as CE
     for a in ("CellPool", "culture_draws", "v_at_end_of_phase2", "phase2_end_outcome",
-              "dipole_frame", "dipole_axis_deg", "electrode_center"):
+              "dipole_frame", "dipole_axis_deg", "electrode_center", "placement_frame"):
         if not hasattr(CE, a):
             missing.append("culture_export.%s" % a)
 except Exception as exc:
@@ -84,11 +96,45 @@ try:
         missing.append("bump_kinetics.common_prefix_len")
 except Exception as exc:
     missing.append("bump_kinetics: %s" % exc)
+for mod in ("video_campaign_check", "make_prob_videos", "make_culture_videos"):
+    try:
+        __import__(mod)
+    except Exception as exc:
+        missing.append("%s: %s" % (mod, exc))
 if missing:
     print("FATAL: the repo is not the current HPC code. Missing:", *missing, sep="\n  - ", file=sys.stderr)
     sys.exit(2)
 print("prerequisites OK")
 PY
+
+# ------------------------------------------------------------------ JOB: the campaign's cultures
+CHECK_PARTS=""
+CHECK_EXTRA=()
+if [ "$ALLOW_MISSING" = "1" ]; then CHECK_EXTRA+=(--allow-missing); fi
+if [ -n "$JOB" ]; then
+    MODEL_EFF="${MODEL:-$(cfg_cell_model)}"
+    CHECK_PARTS="results_${MODEL_EFF}/parts_${JOB}"
+    if [ ! -d "$CHECK_PARTS" ]; then
+        echo "FATAL: JOB=$JOB but there is no $CHECK_PARTS" >&2; exit 1
+    fi
+    if [ -n "$NEURONS" ] || [ -n "$SPAN" ]; then
+        echo "FATAL: JOB=$JOB draws the campaign's own cultures: leave NEURONS and SPAN unset" \
+             "(config gives the campaign's culture size and square)" >&2; exit 1
+    fi
+    JOB_SEED="$(python video_campaign_check.py --seed-of "$CHECK_PARTS")"
+    if [ -n "$SEED" ] && [ "$SEED" != "$JOB_SEED" ]; then
+        echo "FATAL: SEED=$SEED but $JOB ran with seed $JOB_SEED" >&2; exit 1
+    fi
+    SEED="$JOB_SEED"
+    python video_campaign_check.py --precheck --parts "$CHECK_PARTS" --seed "$SEED" \
+        --cultures $(seq "$FIRST" $((FIRST + N_CULTURES - 1))) ${CHECK_EXTRA[@]+"${CHECK_EXTRA[@]}"}
+fi
+if [ -z "$HALF" ]; then
+    HALF="$(python video_campaign_check.py --map-half ${SPAN:+--span-um "$SPAN"})"
+fi
+TAG="${MODEL:-cfg}${JOB:+_$JOB}"
+OUT="${OUT:-video_run_${TAG}_$(date +%Y%m%d_%H%M)}"
+mkdir -p "$OUT"
 
 if [ "${SMOKE:-1}" != "0" ]; then
     echo "--- offline smoke test (no NEURON) ---"
@@ -96,17 +142,25 @@ if [ "${SMOKE:-1}" != "0" ]; then
 fi
 command -v ffmpeg >/dev/null 2>&1 || echo "NOTE: ffmpeg not found -> the videos will be GIF"
 
-echo "model      : ${MODEL:-config.cell_model}"
-echo "cultures   : $N_CULTURES from $FIRST, $NEURONS neurons, span +/-$SPAN um, layers $LAYERS"
-echo "window     : $TMAX ms after the pulse     processes: $NPROC     output: $OUT"
+echo "model      : ${MODEL:-config.cell_model}${JOB:+   campaign job: $JOB ($CHECK_PARTS)}"
+echo "cultures   : $N_CULTURES from $FIRST, seed ${SEED:-config}, ${NEURONS:-config} neurons," \
+     "square ${SPAN:-config}, layers $LAYERS"
+echo "window     : $TMAX ms after the pulse     maps: +/-$HALF um     processes: $NPROC"
+echo "output     : $OUT"
 echo "---------------------------------------------------------------"
 
-ARGS=(--n-cultures "$N_CULTURES" --first-culture "$FIRST" --neurons "$NEURONS"
-      --span-um "$SPAN" --layers "$LAYERS" --tmax-ms "$TMAX" --chunk "$CHUNK"
-      --processes "$NPROC" --out "$OUT")
+ARGS=(--n-cultures "$N_CULTURES" --first-culture "$FIRST" --layers "$LAYERS"
+      --tmax-ms "$TMAX" --chunk "$CHUNK" --processes "$NPROC" --out "$OUT")
+[ -n "$NEURONS" ] && ARGS+=(--neurons "$NEURONS")
+[ -n "$SPAN" ] && ARGS+=(--span-um "$SPAN")
 [ -n "$MODEL" ] && ARGS+=(--cell-model "$MODEL")
 [ -n "$SEED" ] && ARGS+=(--seed "$SEED")
 python video_frames.py "${ARGS[@]}"      # exits non-zero if DeltaV_end differs from the campaign
+
+if [ -n "$CHECK_PARTS" ]; then
+    python video_campaign_check.py --video-dir "$OUT" --parts "$CHECK_PARTS" \
+        ${CHECK_EXTRA[@]+"${CHECK_EXTRA[@]}"}
+fi
 
 if [ "$RENDER" = "1" ]; then
     FIRST_LAYER="${LAYERS%%,*}"

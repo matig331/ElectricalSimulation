@@ -44,6 +44,7 @@ USAGE
 import argparse
 import csv
 import glob
+import io
 import os
 from array import array
 from collections import Counter
@@ -77,37 +78,42 @@ class Scan(object):
         self.full_mask = 0
         self.tail = set()          # (seed, culture, neuron) of the LAST row of each part
         self.n_rows = 0
+        self.sizes = {}            # part -> bytes read in pass 1 (pass 2 reads the same)
 
 
-def _iter_rows(path, n_cols, notes):
+def _iter_rows(path, n_cols, notes, size=None):
     """Yield the complete data rows of one part (its header is skipped; the caller validated
     it). A LAST row that is not newline-terminated or has the wrong number of fields is a
-    write cut by a kill -> dropped and noted. A wrong-length row anywhere else -> SystemExit."""
-    size = os.path.getsize(path)
-    if size == 0:
+    write cut by a kill -> dropped and noted. A wrong-length row anywhere else -> SystemExit.
+
+    Only the first `size` bytes are read (default: the size now). A part can still be growing
+    (a job that is running): scan_parts records the size it read and the writing pass reads
+    exactly the same bytes, so both passes see the same rows. Reading the file to its current
+    end twice made the second pass meet neurons the first had never seen (KeyError, 2026-09-30)."""
+    size = os.path.getsize(path) if size is None else int(size)
+    if size <= 0:
         return
     with open(path, "rb") as fb:
-        fb.seek(size - 1)
-        ends_nl = fb.read(1) in (b"\n", b"\r")
-    with open(path, newline="") as fh:
-        rd = csv.reader(fh)
-        next(rd, None)
-        prev, prev_line = None, 0
-        for row in rd:
-            if not row:
-                continue
-            if prev is not None:
-                if len(prev) != n_cols:
-                    raise SystemExit("%s line %d: %d fields, expected %d -- corrupt part"
-                                     % (path, prev_line, len(prev), n_cols))
-                yield prev
-            prev, prev_line = row, rd.line_num
+        data = fb.read(size)
+    ends_nl = data[-1:] in (b"\n", b"\r")
+    rd = csv.reader(io.StringIO(data.decode("utf-8"), newline=""))
+    next(rd, None)
+    prev, prev_line = None, 0
+    for row in rd:
+        if not row:
+            continue
         if prev is not None:
-            if ends_nl and len(prev) == n_cols:
-                yield prev
-            else:
-                notes.append("%s: dropped a truncated last row (line %d) -- write cut by a kill"
-                             % (path, prev_line))
+            if len(prev) != n_cols:
+                raise SystemExit("%s line %d: %d fields, expected %d -- corrupt part"
+                                 % (path, prev_line, len(prev), n_cols))
+            yield prev
+        prev, prev_line = row, rd.line_num
+    if prev is not None:
+        if ends_nl and len(prev) == n_cols:
+            yield prev
+        else:
+            notes.append("%s: dropped a truncated last row (line %d) -- write cut by a kill, or "
+                         "a row still being written" % (path, prev_line))
 
 
 def scan_parts(part_files, expect_model=None):
@@ -138,10 +144,11 @@ def scan_parts(part_files, expect_model=None):
                              "current parts are different models and are never merged together"
                              % (f, schema, s.schema))
         s.files.append(f)
+        s.sizes[f] = os.path.getsize(f)       # the snapshot both passes read
         pairs_here, n_here, key = set(), 0, None
         i_out = [s.header.index(k) for k in ("fired", "depolarized", "hyperpolarized")
                  if k in s.header]
-        for r in _iter_rows(f, len(s.header), s.notes):
+        for r in _iter_rows(f, len(s.header), s.notes, s.sizes[f]):
             vals = [r[i] for i in i_out]
             if any(v not in ("0", "1") for v in vals) or sum(v == "1" for v in vals) > 1:
                 raise SystemExit("%s: seed=%s culture=%s neuron=%s layer=%s has outcome flags %s "
@@ -242,7 +249,7 @@ def read_parts(part_files, expect_model=None):
     s = scan_parts(part_files, expect_model)
     rows = []
     for f in s.files:
-        for r in _iter_rows(f, len(s.header), []):
+        for r in _iter_rows(f, len(s.header), [], s.sizes[f]):
             if s.mask[(int(r[_SEED]), int(r[_CULTURE]), int(r[_NEURON]))] == s.full_mask:
                 rows.append(r)
     for n in s.notes:
@@ -278,7 +285,7 @@ def merge(parts_pattern, out_dir, make_figures=True, bin_um=8.0, expect_model=No
     n_written = 0
     with OutcomeWriter(out_header, act_path) as ow:
         for f in s.files:
-            for r in _iter_rows(f, len(s.header), []):
+            for r in _iter_rows(f, len(s.header), [], s.sizes[f]):
                 pair = (int(r[_SEED]), int(r[_CULTURE]))
                 if s.mask[pair + (int(r[_NEURON]),)] != s.full_mask:
                     continue

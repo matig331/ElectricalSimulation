@@ -43,7 +43,38 @@ import matplotlib.pyplot as plt
 from matplotlib import animation
 from matplotlib.patches import Rectangle, Patch
 from matplotlib.lines import Line2D
-from scipy.ndimage import gaussian_filter
+
+
+def gaussian_filter(a, sigma, mode="constant", truncate=4.0):
+    """numpy-only equivalent of scipy.ndimage.gaussian_filter(a, sigma, mode="constant",
+    cval=0, truncate=4.0): the same normalised kernel exp(-x^2 / (2 sigma^2)) on
+    x = -r..r, r = int(truncate * sigma + 0.5), applied along every axis in turn with zero
+    padding. scipy is not in the cluster environment (numpy + matplotlib only); this matches
+    scipy to ~1e-15 (smoke_video_campaign.py checks it against a direct 2-D sum)."""
+    if mode != "constant":
+        raise ValueError("only mode='constant' (zero padding) is implemented")
+    a = np.asarray(a, dtype=float)
+    s = float(sigma)
+    r = int(truncate * s + 0.5)
+    if s <= 0.0 or r == 0:
+        return a.copy()
+    x = np.arange(-r, r + 1, dtype=float)
+    w = np.exp(-0.5 * (x / s) ** 2)
+    w /= w.sum()
+    out = a
+    for ax in range(a.ndim):
+        n = out.shape[ax]
+        pad = [(0, 0)] * a.ndim
+        pad[ax] = (r, r)
+        p = np.pad(out, pad, mode="constant")
+        acc = np.zeros_like(out)
+        for k in range(w.size):
+            sl = [slice(None)] * a.ndim
+            sl[ax] = slice(k, k + n)
+            acc += w[k] * p[tuple(sl)]
+        out = acc
+    return out
+
 
 REQUIRED = ["culture", "layer", "x", "y", "t_ms", "dVm_mV", "fired_by_t"]
 PHASE_MS = 0.25          # per phase (config.phase_dur_ms)

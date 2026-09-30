@@ -52,9 +52,19 @@ Probabilità nel video 1: media dei neuroni vicini con un kernel gaussiano di la
 
 Dal cluster, nella cartella del repository aggiornato:
 
+**Video della campagna** (le culture di un job della campagna, per esempio ftd01):
+
+```bash
+qsub -v JOB=ftd01,TMAX=1000 jobs/video_frames.pbs   # culture 0-4 di ftd01, layer 80, 1000 ms
+```
+
+Con `JOB` il seed viene letto da `results_<modello>/parts_<JOB>/`, numero di neuroni e quadrato dei somata sono quelli di `config.py` (gli stessi della campagna). Due controlli: prima di simulare le posizioni delle culture scelte vengono rigenerate e confrontate con le righe della campagna; dopo, ogni neurone x layer del video viene confrontato con la sua riga (specimen, posizione, spike, ΔV_end entro 2e-6 mV). Il job disegna i video solo se tutto coincide (`[campaign check] OK` nel log). Scegliere un job **finito**; `ALLOW_MISSING=1` per un job ancora in corsa.
+
+Senza `JOB`:
+
 ```bash
 git pull                       # deve contenere i file della sezione 6
-qsub jobs/video_frames.pbs     # 5 culture x 1700 neuroni, layer 80, coda 200 ms, e i 3 video
+qsub jobs/video_frames.pbs     # 5 culture di config (seed, neuroni e quadrato di config.py), layer 80, 200 ms
 ```
 
 Per cambiare i parametri, con `-v` (senza spazi dopo le virgole):
@@ -85,16 +95,18 @@ python make_culture_videos.py --frames "CARTELLA/culture_frames_S*_C*.csv" --cul
 
 | Variabile | Default | Cosa cambia |
 |---|---|---|
-| `NEURONS` | 1700 | neuroni per cultura (tutte uguali) |
-| `SPAN` | 571.75 | metà lato del quadrato dei somata, in µm. 571.75 dà 1700 neuroni a 1300/mm². Se cambi `NEURONS`, per tenere la densità: SPAN = 500 × √(NEURONS / 1300) |
+| `NEURONS` | vuoto = `config.py` | neuroni per cultura (tutte uguali); con `JOB` non va dato |
+| `SPAN` | vuoto = `config.py` | metà lato del quadrato dei somata, in µm (centro da `config.placement_centre`); con `JOB` non va dato |
 | `N_CULTURES`, `FIRST` | 5, 0 | quante culture e da quale indice |
 | `LAYERS` | 80 | uno solo costa un terzo; `40,80,120` per tutti e tre |
 | `TMAX` | 200 | ms dopo l'impulso; più lungo = più fotogrammi e più costo |
 | `MODEL` | vuoto = `config.cell_model` | deve essere lo stesso modello delle mappe mostrate in tesi |
-| `SEED` | vuoto = `config.seed` | culture diverse per job diversi |
+| `JOB` | vuoto | un job della campagna (es. `ftd01`): le sue culture, controllate riga per riga |
+| `ALLOW_MISSING` | 0 | 1 = accetta neuroni che un job ancora in corsa non ha scritto |
+| `SEED` | vuoto = `config.seed`, o quello di `JOB` | culture diverse per job diversi |
 | `CHUNK` | 50 | neuroni per pezzo (bilanciamento del carico) |
 | `CULTURE_IDS` | `0 1` | le due culture dei video 2 e 3 |
-| `HALF` | 600 | estensione della mappa nei video (µm) |
+| `HALF` | vuoto = quadrato + 20 µm | estensione della mappa nei video (µm) |
 | `SIGMA` | 20 | lisciamento del video 1 (µm) |
 | `RENDER` | 1 | 0 = solo dati |
 
@@ -145,6 +157,8 @@ python video_frames.py --n-cultures 1 --neurons 20 --layers 80 --tmax-ms 20 --pr
 
 ## 6. File da mettere nel repository
 
-`video_frames.py`, `smoke_video_frames.py`, `make_prob_videos.py`, `smoke_prob_videos.py`, `make_culture_videos.py`, `smoke_culture_videos.py`, `jobs/video_frames.pbs`.
+`video_frames.py`, `smoke_video_frames.py`, `make_prob_videos.py`, `smoke_prob_videos.py`, `make_culture_videos.py`, `smoke_culture_videos.py`, `jobs/video_frames.pbs`, `video_campaign_check.py`, `smoke_video_campaign.py`.
+
+`make_prob_videos.py` non usa più scipy (il cluster non lo ha): lo smoothing gaussiano è in numpy, identico a `scipy.ndimage.gaussian_filter(mode="constant")` (controllato da `smoke_video_campaign.py`).
 
 Usano i file già presenti: `culture_export.py`, `rich_footprint.py`, `bump_kinetics.py`, `config.py`, `field.py`, `morphologies.py`, `slicer.py`. Il job controlla all'inizio che ci siano e che siano le versioni nuove.
