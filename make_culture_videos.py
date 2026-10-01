@@ -30,6 +30,7 @@ project's slicer (morphologies.py + slicer.py must be importable, i.e. run from 
 --n-somata N draws only N neurons of the culture (uniform at random, --somata-seed): the map, the
 "this culture" curves and points are those N neurons, the reference lines all the simulated ones.
 Use it when a culture was simulated with many neurons for a smooth probability video.
+--morph-fraction f: only a random fraction f of the drawn somata get their arbor (1 = all).
 --style plain (default) / specimen: see BRANCH_GREY below.
 
 Run
@@ -203,6 +204,26 @@ def state_counts_vs(coord, df, times, edges, neu):
     return out
 
 
+MORPH_IMAGE_ABOVE = 100   # more morphologies than this: drawn once into an image (_arbor_image)
+
+
+def _arbor_image(layers, half, px=1600):
+    """RGBA image (transparent background) of the given polylines over [-half, half]^2:
+    layers = [(segments, colour, linewidth_pt, alpha)]. The off-screen axes are 8 in wide, about
+    the map's width in the video, so line widths look the same as when drawn directly."""
+    dpi = px / 8.0
+    fig = plt.figure(figsize=(8.0, 8.0), dpi=dpi)
+    ax = fig.add_axes([0, 0, 1, 1])
+    ax.set_xlim(-half, half); ax.set_ylim(-half, half); ax.axis("off")
+    fig.patch.set_alpha(0.0); ax.patch.set_alpha(0.0)
+    for segs, col, w, a in layers:
+        ax.add_collection(LineCollection(segs, colors=col, linewidths=w, alpha=a))
+    fig.canvas.draw()
+    img = np.asarray(fig.canvas.buffer_rgba()).copy()
+    plt.close(fig)
+    return img
+
+
 def state_counts_matrix(coord, dv, fb, edges, neu):
     """state_counts_vs on the neuron x time matrices of neuron_matrices (dv, fb [T, n]) with one
     coordinate per neuron: the same counts, for any subset of the culture's neurons."""
@@ -220,7 +241,10 @@ def state_counts_matrix(coord, dv, fb, edges, neu):
 
 # ----------------------------------------------------------------------------- rendering
 def _draw_scene(ax, half, grid_um, g_grid, vmax, elec_xy, electrode_um, tab, polys, n_morph,
-                centre, h_um, dvm_max=20.0, style="specimen"):
+                centre, h_um, dvm_max=20.0, style="specimen", morph_fraction=1.0, morph_seed=0):
+    """n_morph >= 0: the arbors of the n_morph somata closest to the array; n_morph < 0 (or
+    None): the arbors of a random fraction morph_fraction of the drawn somata (seed morph_seed,
+    so the animation and the snapshots show the same ones)."""
     plain = style == "plain"
     ext = [-half, half, -half, half]
     norm = SymLogNorm(linthresh=1.0, vmin=-vmax, vmax=vmax, base=10)
@@ -229,18 +253,33 @@ def _draw_scene(ax, half, grid_um, g_grid, vmax, elec_xy, electrode_um, tab, pol
     drawn = 0
     if polys and "theta_deg" in tab.columns:
         r = np.hypot(tab["x"] - centre[0], tab["y"] - centre[1]).to_numpy()
-        pick = np.argsort(r)[:n_morph]
+        if n_morph is not None and int(n_morph) >= 0:
+            pick = np.argsort(r)[:int(n_morph)]
+        else:
+            k_m = int(min(max(round(float(morph_fraction) * len(tab)), 0), len(tab)))
+            pick = (np.arange(len(tab)) if k_m == len(tab) else
+                    np.sort(np.random.default_rng(morph_seed).choice(len(tab), size=k_m,
+                                                                     replace=False)))
         segs = {}
         for i in pick:
             row = tab.iloc[i]
             for p in polys.get(str(row["morph"]), []):
-                segs.setdefault(str(row["morph"]), []).append(
+                segs.setdefault("all" if plain else str(row["morph"]), []).append(
                     rotate_translate(p, row["x"], row["y"], row["theta_deg"]))
             drawn += 1
-        for m, s in segs.items():
-            ax.add_collection(LineCollection(s, colors=BRANCH_GREY if plain else spec_color(m),
-                                             linewidths=0.6, alpha=0.9 if plain else 0.55,
-                                             zorder=3))
+        # many morphologies (every drawn soma has its own): thinner, lighter lines, so the field
+        # and the somata stay visible through the arbor
+        lw, al = (0.6, 0.9) if drawn <= 100 else ((0.4, 0.7) if drawn <= 600 else (0.3, 0.55))
+        layers = [(s, BRANCH_GREY if plain else spec_color(m), lw if plain else 0.6,
+                   al if plain else 0.55) for m, s in segs.items()]
+        if drawn > MORPH_IMAGE_ABOVE:
+            # the arbor never changes: draw it ONCE into a transparent image instead of redrawing
+            # ~10^5 polylines in every frame (2000 morphologies: ~8 s -> well under 1 s a frame)
+            ax.imshow(_arbor_image(layers, half), extent=ext, origin="upper",
+                      interpolation="antialiased", zorder=3)
+        else:
+            for s, col, w, a in layers:
+                ax.add_collection(LineCollection(s, colors=col, linewidths=w, alpha=a, zorder=3))
     patches = []
     for (ex, ey) in elec_xy:
         rct = Rectangle((ex - electrode_um / 2, ey - electrode_um / 2), electrode_um, electrode_um,
@@ -351,9 +390,11 @@ def render_culture(cid, times, tab, dv, fb, polys, ens, cul, edges_r, elec_xy, e
     ax_n = fig.add_subplot(gs[1, 1], sharex=ax_i)
     ax_r = fig.add_subplot(gs[2, 1])
 
+    mfrac = float(getattr(args, "morph_fraction", 1.0))
+    mseed = int(getattr(args, "somata_seed", 0)) + 1
     im, patches, scat, drawn = _draw_scene(ax_m, half, args.grid, g_grid, vmax, elec_xy,
                                            ph["electrode_um"], tab, polys, args.n_morph, centre,
-                                           ph["h_soma_um"], args.dvm_max, style)
+                                           ph["h_soma_um"], args.dvm_max, style, mfrac, mseed)
     cb = fig.colorbar(im, ax=ax_m, fraction=0.035, pad=0.02)
     cb.set_label("extracellular potential Ve (mV, symlog)")
     if args.soma_color == "dvm":
@@ -442,7 +483,7 @@ def render_culture(cid, times, tab, dv, fb, polys, ens, cul, edges_r, elec_xy, e
         t = float(times[k])
         im2, pt2, sc2, _ = _draw_scene(ax, half, args.grid, g_grid, vmax, elec_xy, ph["electrode_um"],
                                        tab, polys, args.n_morph, centre, ph["h_soma_um"], args.dvm_max,
-                                       style)
+                                       style, mfrac, mseed)
         im2.set_data(g_grid * i0_A * float(P.pulse_current([t])[0]))
         for p_, c in zip(pt2, P._elec_colors(elec_sign, float(P.pulse_current([t])[0]))):
             p_.set_facecolor(c)
@@ -468,7 +509,12 @@ def main(argv=None):
     ap.add_argument("--layer", type=float, default=None, help="default: middle layer present")
     ap.add_argument("--half", type=float, default=400.0)
     ap.add_argument("--grid", type=float, default=4.0, help="field image resolution (um)")
-    ap.add_argument("--n-morph", type=int, default=15, help="morphologies drawn (closest to array)")
+    ap.add_argument("--n-morph", type=int, default=-1,
+                    help="-1 (default): arbors of a random --morph-fraction of the drawn somata; "
+                         "k >= 0: only the arbors of the k somata closest to the array")
+    ap.add_argument("--morph-fraction", type=float, default=1.0,
+                    help="fraction of the drawn somata whose arbor is drawn, chosen at random "
+                         "(seed --somata-seed + 1); 1 = all, 0 = none")
     ap.add_argument("--panel", choices=("theta", "r"), default="theta",
                     help="bottom panel: P(state | angle to dipole axis) or P(state | distance)")
     ap.add_argument("--thbin", type=float, default=15.0, help="angle bin (deg)")

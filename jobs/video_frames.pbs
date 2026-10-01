@@ -7,13 +7,14 @@
 #   qsub -v MODEL=soma_only jobs/video_frames.pbs             # another cell model
 #   qsub -v RENDER=0 jobs/video_frames.pbs                    # data only, render later
 #   qsub -l nodes=1:ppn=4 -l walltime=01:00:00 \
-#        -v FRAMES_DIR=video_run_cfg_20260930_1719,VIDEOS=culture,CULTURE_IDS=0,PLOT_NEURONS=2000 \
+#        -v FRAMES_DIR=video_run_cfg_20260930_1719,VIDEOS=culture,CULTURE_IDS=0,PLOT_NEURONS=2000,MORPH_FRACTION=0.1 \
 #        jobs/video_frames.pbs                                 # re-render only, no simulation
 #
 # FRAMES_DIR=<an earlier output folder> renders again from its frames, in that folder -- no
 # simulation, no checks. VIDEOS = all | prob | culture picks what is drawn. PLOT_NEURONS = the
-# neurons drawn in each culture video (2000 by default, 0 = all; the probability video always
-# uses every simulated neuron).
+# neurons drawn in each culture video (2000 by default, 0 = all), MORPH_FRACTION = the fraction of
+# them drawn with their morphology, at random (0.1 by default; 1 = all -- 2000 arbors fill the
+# square with grey). The probability video always uses every simulated neuron.
 #
 # JOB=<campaign job> (e.g. ftd01) makes the videos from THAT job's cultures: its seed is read
 # from results_<model>/parts_<JOB>/, the culture size and soma square are config's (the ones
@@ -78,6 +79,7 @@ ALLOW_MISSING="${ALLOW_MISSING:-0}"
 FRAMES_DIR="${FRAMES_DIR:-}"       # an earlier output folder: render again, no simulation
 VIDEOS="${VIDEOS:-all}"            # all | prob | culture
 PLOT_NEURONS="${PLOT_NEURONS:-2000}"   # neurons drawn per culture video (0 = all)
+MORPH_FRACTION="${MORPH_FRACTION:-0.1}"  # fraction of them drawn with their morphology (1 = all)
 case "$VIDEOS" in all|prob|culture) ;; *) echo "FATAL: VIDEOS=$VIDEOS (all, prob or culture)" >&2; exit 1 ;; esac
 NPROC="${PBS_NUM_PPN:-${PBS_NP:-$(nproc)}}"
 
@@ -173,7 +175,7 @@ command -v ffmpeg >/dev/null 2>&1 || echo "NOTE: ffmpeg not found -> the videos 
 
 if [ -n "$FRAMES_DIR" ]; then
     echo "render only: frames of $FRAMES_DIR (no simulation)     videos: $VIDEOS"
-    echo "maps       : +/-$HALF um     neurons drawn per culture video: $PLOT_NEURONS"
+    echo "maps       : +/-$HALF um     culture video: $PLOT_NEURONS neurons, $MORPH_FRACTION of them with morphology"
     echo "---------------------------------------------------------------"
 else
 echo "model      : ${MODEL:-config.cell_model}${JOB:+   campaign job: $JOB ($CHECK_PARTS)}"
@@ -205,10 +207,12 @@ if [ "$RENDER" = "1" ]; then
             --sigma "$SIGMA" --outdir "$OUT"
     fi
     if [ "$VIDEOS" != "prob" ]; then
-        echo "--- videos 2-3: cultures $CULTURE_IDS, layer $FIRST_LAYER, $PLOT_NEURONS neurons drawn ---"
+        echo "--- videos 2-3: cultures $CULTURE_IDS, layer $FIRST_LAYER, $PLOT_NEURONS neurons drawn," \
+             "a fraction $MORPH_FRACTION of them with their morphology ---"
         python make_culture_videos.py --frames "$OUT/culture_frames_S*_C*.csv" --list
         python make_culture_videos.py --frames "$OUT/culture_frames_S*_C*.csv" --cultures $CULTURE_IDS \
-            --layer "$FIRST_LAYER" --half "$HALF" --n-somata "$PLOT_NEURONS" --outdir "$OUT"
+            --layer "$FIRST_LAYER" --half "$HALF" --n-somata "$PLOT_NEURONS" \
+            --morph-fraction "$MORPH_FRACTION" --outdir "$OUT"
     fi
 fi
 echo "done -> $OUT"

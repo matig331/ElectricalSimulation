@@ -80,10 +80,10 @@ Il log è in `logs/estim_video_frames.log`, i risultati in `video_run_<modello>_
 **Ridisegnare senza simulare** (dai fotogrammi di una corsa già fatta, nella stessa cartella):
 
 ```bash
-qsub -l nodes=1:ppn=4 -l walltime=01:00:00 -v FRAMES_DIR=video_run_cfg_20260930_1719,VIDEOS=culture,CULTURE_IDS=0,PLOT_NEURONS=2000 jobs/video_frames.pbs
+qsub -l nodes=1:ppn=4 -l walltime=01:00:00 -v FRAMES_DIR=video_run_cfg_20260930_1719,VIDEOS=culture,CULTURE_IDS=0,PLOT_NEURONS=2000,MORPH_FRACTION=0.1 jobs/video_frames.pbs
 ```
 
-`VIDEOS` = `all` | `prob` | `culture`. `PLOT_NEURONS` = neuroni disegnati in ciascun video di cultura (scelti a caso, 2000 di default, 0 = tutti): mappa, curve e punti "this culture" sono quei neuroni, le linee di riferimento tutti i neuroni simulati. Il video di probabilità usa sempre tutti i neuroni.
+`VIDEOS` = `all` | `prob` | `culture`. `PLOT_NEURONS` = neuroni disegnati in ciascun video di cultura (scelti a caso, 2000 di default, 0 = tutti); `MORPH_FRACTION` = frazione di questi disegnata con la sua morfologia (a caso, 0.1 di default; 1 = tutti, ma 2000 arborizzazioni coprono il quadrato di grigio): mappa, curve e punti "this culture" sono quei neuroni, le linee di riferimento tutti i neuroni simulati. Il video di probabilità usa sempre tutti i neuroni.
 
 **Disegnare i video dopo, o sul Mac** (non serve NEURON; copia la cartella dei risultati):
 
@@ -120,6 +120,7 @@ python make_culture_videos.py --frames "CARTELLA/culture_frames_S*_C*.csv" --cul
 | `FRAMES_DIR` | vuoto | cartella di una corsa già fatta: solo disegno, nessuna simulazione |
 | `VIDEOS` | `all` | `prob` o `culture` per disegnarne uno solo |
 | `PLOT_NEURONS` | 2000 | neuroni disegnati nei video di cultura (0 = tutti) |
+| `MORPH_FRACTION` | 0.1 | frazione dei neuroni disegnati che ha la morfologia (a caso; 1 = tutti) |
 
 Risorse nell'intestazione del `.pbs`: `ppn=32`, `walltime=04:00:00`, coda `cpu`. Adattale al cluster.
 
@@ -129,7 +130,8 @@ Risorse nell'intestazione del `.pbs`: `ppn=32`, `walltime=04:00:00`, coda `cpu`.
 |---|---|---|
 | `--neu` | 1.0 | soglia depol/iper in mV (quella della statistica) |
 | `--fps`, `--hold-end` | 12, 2 s | velocità del video e pausa finale |
-| `--n-morph` | 15 | morfologie disegnate nei video 2 e 3 |
+| `--n-morph` | -1 | -1: morfologie di una frazione `--morph-fraction` dei somi disegnati, a caso; k: solo i k somi più vicini agli elettrodi |
+| `--morph-fraction` | 1.0 | frazione dei somi disegnati con la morfologia (il job passa `MORPH_FRACTION`) |
 | `--soma-color` | `dvm` | `state` per i tre stati discreti |
 | `--n-somata` | 0 = tutti | neuroni disegnati per cultura (a caso, `--somata-seed`) |
 | `--style` | `plain` | `plain`: rami grigio chiaro, somi cerchietti senza bordo (la morfologia non conta); `specimen`: colori per specimen |

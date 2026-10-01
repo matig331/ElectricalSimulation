@@ -21,7 +21,9 @@ Checks
  11  soma gradient: +10 mV is red, -10 mV is blue, 0 is near white; state mode still renders
  12  --n-somata: a seeded random subset is drawn; its counts (state_counts_matrix) equal a direct
      recount of those neurons; the plain style has grey branches and edge-less somata; the
-     specimen style still renders
+     specimen style still renders; --morph-fraction f gives round(f n) random somata their arbor
+     (the same ones on every call), all of them by default; more than MORPH_IMAGE_ABOVE arbors
+     are drawn once as a grey image layer
 
 Paths: run it from the project folder. If the project's morphologies.py is importable, the three
 REAL specimens are used; otherwise a stub maps every name to one .asc (MORPH_ASC, or the first
@@ -227,12 +229,37 @@ def main():
     noedge = all(len(sc[q].get_linewidths()) == 0 or float(np.max(sc[q].get_linewidths())) == 0.0
                  for q in ("act", "grad"))
     plt.close(fig)
+    fig, ax = plt.subplots()                    # > MORPH_IMAGE_ABOVE morphologies: one image layer
+    _, _, _, nd_all = C._draw_scene(ax, 400.0, 50.0, gg, 1.0, elec, 25.0, tab, polys, -1, centre,
+                                    10.0, 20.0, "plain")
+    ims = [im_ for im_ in ax.images if im_.get_zorder() == 3]
+    arr = np.asarray(ims[0].get_array()) if ims else np.zeros((1, 1, 4))
+    ink = arr[..., 3] > 0
+    grey_img = bool(ink.any()) and np.allclose(arr[ink][:, :3].mean(axis=0) / 255.0,
+                                               C.matplotlib.colors.to_rgb(C.BRANCH_GREY), atol=0.06)
+    plt.close(fig)
+
+    def arbors(frac, seed):                     # a random fraction of the drawn somata
+        f_, a_ = plt.subplots()
+        _, _, _, n_ = C._draw_scene(a_, 400.0, 50.0, gg, 1.0, elec, 25.0, tab, polys, -1, centre,
+                                    10.0, 20.0, "plain", frac, seed)
+        sg = [q for c in a_.collections if isinstance(c, LineCollection) for q in c.get_segments()]
+        plt.close(f_)
+        return n_, sg
+    nq, sa = arbors(0.25, 7)
+    nq2, sb = arbors(0.25, 7)
+    n0, _ = arbors(0.0, 7)
+    frac_ok = (nq == round(0.25 * len(tab)) and nq2 == nq and n0 == 0 and len(sa) == len(sb) > 0
+               and all(np.array_equal(u, v) for u, v in zip(sa, sb)))
     pspec = C.main(["--frames", path, "--cultures", "1", "--layer", "80", "--style", "specimen",
                     "--hold-end", "0", "--outdir", os.path.join(OUT, "specimen")])
     ok &= report("12", same and len(p12) == 1 and os.path.getsize(p12[0]) > 10_000 and nd == min(5, 40)
-                 and grey and noedge and len(pspec) == 1,
+                 and grey and noedge and len(pspec) == 1 and nd_all == len(tab) and grey_img
+                 and frac_ok,
                  f"subset counts == direct recount: {same}; 40-neuron video written; branches grey: "
-                 f"{grey} ({len(lc)} collections); soma edges off: {noedge}; specimen style renders")
+                 f"{grey} ({len(lc)} collections); soma edges off: {noedge}; specimen style renders; "
+                 f"--n-morph -1 draws all {nd_all} arbors as one grey image layer: {grey_img}; "
+                 f"--morph-fraction 0.25 -> {nq} of {len(tab)} arbors, same ones again, 0 -> {n0}")
 
     print("\nSMOKE TEST:", "ALL PASSED" if ok else "SOME CHECKS FAILED")
     return ok
