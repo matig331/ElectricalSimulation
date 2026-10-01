@@ -27,9 +27,15 @@ Input: frames from culture_export_video.py (video_run/culture_frames*.csv, with 
 video_run/electrodes.csv. Without theta_deg only somata are drawn. Morphologies are read with the
 project's slicer (morphologies.py + slicer.py must be importable, i.e. run from the project folder).
 
+--n-somata N draws only N neurons of the culture (uniform at random, --somata-seed): the map, the
+"this culture" curves and points are those N neurons, the reference lines all the simulated ones.
+Use it when a culture was simulated with many neurons for a smooth probability video.
+--style plain (default) / specimen: see BRANCH_GREY below.
+
 Run
     python make_culture_videos.py --frames "video_run/culture_frames*.csv" --list
     python make_culture_videos.py --frames "video_run/culture_frames*.csv" --cultures 0 7 --layer 80
+    python make_culture_videos.py --frames "video_run/culture_frames*.csv" --cultures 0 --n-somata 2000
 Smoke test: python smoke_culture_videos.py
 """
 import argparse
@@ -63,6 +69,11 @@ def dvm_rgba(values, vmax):
     """Colour of a non-spiking soma for a given dVm (mV)."""
     return plt.get_cmap(DVM_CMAP)(dvm_norm(vmax)(np.asarray(values, float)))
 MARK = {"act": ("*", 150), "dep": ("^", 50), "hyp": ("v", 50), "neu": ("o", 20)}
+# --style plain (default): the specimen does not matter -- branches light grey, every soma a small
+# circle with no edge, filled by its dVm(t) (activated: green). --style specimen: the old look.
+BRANCH_GREY = "#c4c4c4"
+SOMA_S = 12               # plain style: soma marker area (pt^2)
+NEUTRAL_FILL = "0.75"     # plain style, --soma-color state: neutral somata (white would vanish)
 
 
 # ----------------------------------------------------------------------------- parameters
@@ -192,9 +203,25 @@ def state_counts_vs(coord, df, times, edges, neu):
     return out
 
 
+def state_counts_matrix(coord, dv, fb, edges, neu):
+    """state_counts_vs on the neuron x time matrices of neuron_matrices (dv, fb [T, n]) with one
+    coordinate per neuron: the same counts, for any subset of the culture's neurons."""
+    r = np.asarray(coord, float)
+    bi = np.digitize(r, edges) - 1
+    ok = (bi >= 0) & (bi < len(edges) - 1)
+    T, nb = dv.shape[0], len(edges) - 1
+    out = {k: np.zeros((T, nb)) for k in ("n", "act", "dep", "hyp")}
+    for k in range(T):
+        act, dep, hyp = P.states(dv[k], fb[k], neu)
+        for key, v in (("n", np.ones(act.size)), ("act", act), ("dep", dep), ("hyp", hyp)):
+            np.add.at(out[key][k], bi[ok], np.asarray(v, float)[ok])
+    return out
+
+
 # ----------------------------------------------------------------------------- rendering
 def _draw_scene(ax, half, grid_um, g_grid, vmax, elec_xy, electrode_um, tab, polys, n_morph,
-                centre, h_um, dvm_max=20.0):
+                centre, h_um, dvm_max=20.0, style="specimen"):
+    plain = style == "plain"
     ext = [-half, half, -half, half]
     norm = SymLogNorm(linthresh=1.0, vmin=-vmax, vmax=vmax, base=10)
     im = ax.imshow(np.zeros_like(g_grid), origin="lower", extent=ext, cmap=FIELD_CMAP,
@@ -211,8 +238,9 @@ def _draw_scene(ax, half, grid_um, g_grid, vmax, elec_xy, electrode_um, tab, pol
                     rotate_translate(p, row["x"], row["y"], row["theta_deg"]))
             drawn += 1
         for m, s in segs.items():
-            ax.add_collection(LineCollection(s, colors=spec_color(m), linewidths=0.6,
-                                             alpha=0.55, zorder=3))
+            ax.add_collection(LineCollection(s, colors=BRANCH_GREY if plain else spec_color(m),
+                                             linewidths=0.6, alpha=0.9 if plain else 0.55,
+                                             zorder=3))
     patches = []
     for (ex, ey) in elec_xy:
         rct = Rectangle((ex - electrode_um / 2, ey - electrode_um / 2), electrode_um, electrode_um,
@@ -220,43 +248,68 @@ def _draw_scene(ax, half, grid_um, g_grid, vmax, elec_xy, electrode_um, tab, pol
         ax.add_patch(rct); patches.append(rct)
     scat = {}
     for key, (mk, sz) in MARK.items():
-        scat[key] = ax.scatter([], [], marker=mk, s=sz, linewidths=0.6, zorder=5)
+        if plain:
+            scat[key] = ax.scatter([], [], marker="o", s=SOMA_S, linewidths=0.0,
+                                   zorder=6 if key == "act" else 5)
+        else:
+            scat[key] = ax.scatter([], [], marker=mk, s=sz, linewidths=0.6, zorder=5)
     scat["grad"] = ax.scatter([], [], c=[], cmap=DVM_CMAP, norm=dvm_norm(dvm_max), marker="o",
-                              s=40, linewidths=1.3, zorder=5)
+                              s=SOMA_S if plain else 40, linewidths=0.0 if plain else 1.3,
+                              zorder=5)
     ax.set_xlim(-half, half); ax.set_ylim(-half, half); ax.set_aspect("equal")
     ax.set_xlabel("x (um)"); ax.set_ylabel("y (um)")
     return im, patches, scat, drawn
 
 
-def _update_somata(scat, tab, st, dvk=None, mode="dvm"):
-    """Edge = specimen. mode 'dvm': activated = green star, the others filled by their dVm on a
-    continuous red-blue gradient. mode 'state': fill = discrete state (as the probability video)."""
+def _update_somata(scat, tab, st, dvk=None, mode="dvm", style="specimen"):
+    """style 'specimen': edge = specimen; style 'plain': no edge. mode 'dvm': activated = green
+    (star, or a circle in the plain style), the others filled by their dVm on a continuous
+    red-blue gradient. mode 'state': fill = discrete state (as the probability video)."""
     xy = tab[["x", "y"]].to_numpy(float)
-    edge = np.array([spec_color(m) for m in tab["morph"]])
+    plain = style == "plain"
+    edge = None if plain else np.array([spec_color(m) for m in tab["morph"]])
     empty = np.empty((0, 2))
+
+    def edges(sc, m):
+        if plain:
+            sc.set_edgecolor("none"); sc.set_linewidth(0.0)
+        else:
+            sc.set_edgecolor(edge[m] if m.any() else []); sc.set_linewidth(1.3)
     if mode == "dvm":
         a = st["act"]
         scat["act"].set_offsets(xy[a] if a.any() else empty)
         scat["act"].set_facecolor([P.COL["act"]] * int(a.sum()) if a.any() else [])
-        scat["act"].set_edgecolor(edge[a] if a.any() else []); scat["act"].set_linewidth(1.3)
+        edges(scat["act"], a)
         g = ~a
         scat["grad"].set_offsets(xy[g] if g.any() else empty)
         scat["grad"].set_array(np.asarray(dvk, float)[g] if g.any() else np.array([]))
-        scat["grad"].set_edgecolor(edge[g] if g.any() else [])
+        edges(scat["grad"], g)
         for key in ("dep", "hyp", "neu"):
             scat[key].set_offsets(empty)
         return
     scat["grad"].set_offsets(empty); scat["grad"].set_array(np.array([]))
-    fill = {"act": P.COL["act"], "dep": P.COL["dep"], "hyp": P.COL["hyp"], "neu": "white"}
+    fill = {"act": P.COL["act"], "dep": P.COL["dep"], "hyp": P.COL["hyp"],
+            "neu": NEUTRAL_FILL if plain else "white"}
     for key in ("act", "dep", "hyp", "neu"):
         m = st[key]
         scat[key].set_offsets(xy[m] if m.any() else empty)
         scat[key].set_facecolor([fill[key]] * int(m.sum()) if m.any() else [])
-        scat[key].set_edgecolor(edge[m] if m.any() else [])
-        scat[key].set_linewidth(1.3)
+        edges(scat[key], m)
 
 
-def _scene_legend(ax, specimens, mode="dvm"):
+def _scene_legend(ax, specimens, mode="dvm", style="specimen"):
+    if style == "plain":
+        def dot(c, lab):
+            return Line2D([0], [0], marker="o", ls="", mfc=c, mec="none", ms=6, label=lab)
+        h = [Line2D([0], [0], color=BRANCH_GREY, lw=2, label="dendrites / axon")]
+        if mode == "dvm":
+            h += [dot(P.COL["act"], "activated"), dot(P.COL["dep"], "soma: dVm > 0"),
+                  dot(P.COL["hyp"], "soma: dVm < 0")]
+        else:
+            h += [dot(P.COL["act"], "activated"), dot(P.COL["dep"], "depolarized"),
+                  dot(P.COL["hyp"], "hyperpolarized"), dot(NEUTRAL_FILL, "neutral")]
+        ax.legend(handles=h, loc="upper left", fontsize=7, framealpha=0.9)
+        return
     h = [Line2D([0], [0], color=spec_color(m), lw=2, label=f"specimen {m} (line / soma edge)")
          for m in specimens]
     if mode == "dvm":
@@ -273,8 +326,15 @@ def _scene_legend(ax, specimens, mode="dvm"):
 
 
 def render_culture(cid, times, tab, dv, fb, polys, ens, cul, edges_r, elec_xy, elec_sign, ph,
-                   args, out_stem, xlabel="distance from dipole centre (um)"):
+                   args, out_stem, xlabel="distance from dipole centre (um)", n_culture=None,
+                   n_ensemble=None):
+    """n_culture / n_ensemble: given when only some of the culture's neurons are drawn
+    (--n-somata): the culture's size and the number of simulated neurons the lines use."""
     half = args.half
+    style = getattr(args, "style", "specimen")
+    subset = bool(n_culture) and n_culture > len(tab)
+    cul_lab = ("the %d neurons shown" % len(tab)) if subset else "this culture"
+    ens_lab = ("all %d simulated neurons" % n_ensemble) if (subset and n_ensemble) else "all cultures"
     xg = np.arange(-half, half + args.grid / 2, args.grid)
     Xg, Yg = np.meshgrid(xg, xg)
     g_grid = field_mV_per_A(Xg, Yg, elec_xy, elec_sign, ph["sigma_Sm"], ph["rmin_um"], ph["h_soma_um"])
@@ -293,7 +353,7 @@ def render_culture(cid, times, tab, dv, fb, polys, ens, cul, edges_r, elec_xy, e
 
     im, patches, scat, drawn = _draw_scene(ax_m, half, args.grid, g_grid, vmax, elec_xy,
                                            ph["electrode_um"], tab, polys, args.n_morph, centre,
-                                           ph["h_soma_um"], args.dvm_max)
+                                           ph["h_soma_um"], args.dvm_max, style)
     cb = fig.colorbar(im, ax=ax_m, fraction=0.035, pad=0.02)
     cb.set_label("extracellular potential Ve (mV, symlog)")
     if args.soma_color == "dvm":
@@ -302,7 +362,7 @@ def render_culture(cid, times, tab, dv, fb, polys, ens, cul, edges_r, elec_xy, e
         cb2.set_ticks([-v, -v / 4, -1, 0, 1, v / 4, v])
         cb2.set_ticklabels([f"{x:g}" for x in (-v, -v / 4, -1, 0, 1, v / 4, v)])
         cb2.set_label("soma DeltaVm (mV, symlog)   red = depolarized, blue = hyperpolarized")
-    _scene_legend(ax_m, sorted(tab["morph"].astype(str).unique()), args.soma_color)
+    _scene_legend(ax_m, sorted(tab["morph"].astype(str).unique()), args.soma_color, style)
 
     tt = np.unique(np.r_[np.linspace(times.min(), min(times.max(), 0.7), 800), times])
     ax_i.plot(tt, P.pulse_current(tt), "k", lw=1.3)
@@ -314,11 +374,11 @@ def render_culture(cid, times, tab, dv, fb, polys, ens, cul, edges_r, elec_xy, e
     def pct(d, key):
         n = d["n"].sum(axis=1); return 100 * d[key].sum(axis=1) / np.maximum(n, 1)
     for key in ("act", "dep", "hyp"):
-        ax_n.plot(times, pct(cul, key), color=P.COL[key], lw=2.0, label=f"{P.LABEL[key]}: this culture")
+        ax_n.plot(times, pct(cul, key), color=P.COL[key], lw=2.0, label=f"{P.LABEL[key]}: {cul_lab}")
         ax_n.plot(times, pct(ens, key), color=P.COL[key], lw=1.3, ls="--")
-    ax_n.plot([], [], color="0.3", ls="--", label="expected from all cultures")
+    ax_n.plot([], [], color="0.3", ls="--", label=f"expected from {ens_lab}")
     ax_n.axvspan(-0.5, 0, color="0.93", zorder=0)
-    ax_n.set_ylim(0, 100); ax_n.set_ylabel("% of this culture's neurons")
+    ax_n.set_ylim(0, 100); ax_n.set_ylabel("% of neurons" if subset else "% of this culture's neurons")
     ax_n.set_xlabel("time from end of phase 2 (ms)" +
                     ("  [linear |t|<1 ms, log beyond]" if times.max() > 2 else ""))
     ax_n.legend(fontsize=7, loc="center right"); ax_n.grid(alpha=0.2)
@@ -347,7 +407,7 @@ def render_culture(cid, times, tab, dv, fb, polys, ens, cul, edges_r, elec_xy, e
         ax_r.set_xlabel(xlabel); ax_r.set_ylabel("P(state)")
         if args.panel == "theta":
             ax_r.set_xticks([0, 45, 90, 135, 180])
-        ax_r.set_title("lines: all cultures   |   points: this culture (Wilson 95% CI)", fontsize=8.5)
+        ax_r.set_title(f"lines: {ens_lab}   |   points: {cul_lab} (Wilson 95% CI)", fontsize=8.5)
         ax_r.grid(alpha=0.2)
 
     def update(k):
@@ -357,15 +417,17 @@ def render_culture(cid, times, tab, dv, fb, polys, ens, cul, edges_r, elec_xy, e
             p_.set_facecolor(c)
         a, d_, h_ = P.states(dv[k], fb[k], args.neu)
         _update_somata(scat, tab, {"act": a, "dep": d_, "hyp": h_, "neu": ~(a | d_ | h_)},
-                       dv[k], args.soma_color)
+                       dv[k], args.soma_color, style)
         for c in cursors:
             c.set_xdata([t, t])
         draw_r(k)
         sup.set_text(f"Culture {cid}  --  layer {args.layer:.0f} um   |   t = {t:+.3f} ms   |   "
                      f"{P._phase_label(t)}")
-        note.set_text(f"this culture: activated {a.sum()} ({100*a.mean():.1f}%)   depolarized "
+        note.set_text(f"{cul_lab}: activated {a.sum()} ({100*a.mean():.1f}%)   depolarized "
                       f"{d_.sum()} ({100*d_.mean():.1f}%)   hyperpolarized {h_.sum()} "
-                      f"({100*h_.mean():.1f}%)   of {n_neu} neurons   |   morphologies drawn: {drawn}")
+                      f"({100*h_.mean():.1f}%)   of {n_neu} neurons"
+                      + (f" (drawn at random from {n_culture})" if subset else "")
+                      + f"   |   morphologies drawn: {drawn}")
         return [im, sup, note]
 
     anim = animation.FuncAnimation(fig, update, frames=seq, blit=False)
@@ -379,16 +441,18 @@ def render_culture(cid, times, tab, dv, fb, polys, ens, cul, edges_r, elec_xy, e
     for ax, k in zip(np.atleast_1d(axes), idx):
         t = float(times[k])
         im2, pt2, sc2, _ = _draw_scene(ax, half, args.grid, g_grid, vmax, elec_xy, ph["electrode_um"],
-                                       tab, polys, args.n_morph, centre, ph["h_soma_um"], args.dvm_max)
+                                       tab, polys, args.n_morph, centre, ph["h_soma_um"], args.dvm_max,
+                                       style)
         im2.set_data(g_grid * i0_A * float(P.pulse_current([t])[0]))
         for p_, c in zip(pt2, P._elec_colors(elec_sign, float(P.pulse_current([t])[0]))):
             p_.set_facecolor(c)
         a, d_, h_ = P.states(dv[k], fb[k], args.neu)
         _update_somata(sc2, tab, {"act": a, "dep": d_, "hyp": h_, "neu": ~(a | d_ | h_)},
-                       dv[k], args.soma_color)
+                       dv[k], args.soma_color, style)
         ax.set_title(f"t = {t:+.3f} ms ({P._phase_label(t)})\nact {100*a.mean():.1f}%  "
                      f"dep {100*d_.mean():.1f}%  hyp {100*h_.mean():.1f}%", fontsize=10)
-    _scene_legend(np.atleast_1d(axes)[0], sorted(tab["morph"].astype(str).unique()), args.soma_color)
+    _scene_legend(np.atleast_1d(axes)[0], sorted(tab["morph"].astype(str).unique()), args.soma_color,
+                  style)
     fig.suptitle(f"Culture {cid} -- layer {args.layer:.0f} um", fontsize=12)
     fig.tight_layout()
     fig.savefig(out_stem.replace("culture_video", "culture_snapshots") + ".png", dpi=140)
@@ -413,6 +477,11 @@ def main(argv=None):
     ap.add_argument("--soma-color", choices=("dvm", "state"), default="dvm",
                     help="soma fill: continuous dVm gradient (default) or discrete state")
     ap.add_argument("--dvm-max", type=float, default=20.0, help="dVm colour-scale limit (mV)")
+    ap.add_argument("--n-somata", type=int, default=0,
+                    help="neurons drawn per culture video, uniform at random (0 = all)")
+    ap.add_argument("--somata-seed", type=int, default=0, help="seed of that random choice")
+    ap.add_argument("--style", choices=("plain", "specimen"), default="plain",
+                    help="plain: grey branches, small edge-less circles; specimen: coloured by specimen")
     ap.add_argument("--fps", type=int, default=12)
     ap.add_argument("--hold-end", type=float, default=2.0)
     ap.add_argument("--outdir", default="video_run")
@@ -468,13 +537,24 @@ def main(argv=None):
         t_c, tab, dv, fb = neuron_matrices(sub)
         if not np.allclose(t_c, times):
             print(f"  culture_id {cid}: frame times differ from the ensemble, skipped"); continue
-        cul = state_counts_vs(coord(sub), sub, times, edges_r, args.neu)
+        n_cul, n_ens = len(tab), None
+        if 0 < args.n_somata < n_cul:
+            keep = np.sort(np.random.default_rng(args.somata_seed).choice(n_cul, size=args.n_somata,
+                                                                          replace=False))
+            tab = tab.iloc[keep].reset_index(drop=True)
+            dv, fb = dv[:, keep], fb[:, keep]
+            cul = state_counts_matrix(coord(tab), dv, fb, edges_r, args.neu)
+            n_ens = int(len(df) // len(times))
+        else:
+            cul = state_counts_vs(coord(sub), sub, times, edges_r, args.neu)
         stem = os.path.join(args.outdir, f"culture_video_{cid}_L{args.layer:.0f}")
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             path, drawn = render_culture(cid, times, tab, dv, fb, polys, ens, cul, edges_r,
-                                         elec_xy, elec_sign, ph, args, stem, xlabel)
-        print(f"  culture {cid}: {len(tab)} neurons, {drawn} morphologies, {len(times)} frames -> {path}")
+                                         elec_xy, elec_sign, ph, args, stem, xlabel,
+                                         n_culture=n_cul, n_ensemble=n_ens)
+        print(f"  culture {cid}: {len(tab)} of {n_cul} neurons drawn, {drawn} morphologies, "
+              f"{len(times)} frames -> {path}")
         paths.append(path)
     return paths
 

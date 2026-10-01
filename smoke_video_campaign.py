@@ -12,10 +12,11 @@ cultures), no simulation.
   4  the precheck regenerates placements with culture_draws: the campaign's culture size,
      square and seed pass; another culture size, the legacy square, another seed fail
   5  jobs/video_frames.pbs with JOB=<job> (video_frames.py on its NEURON-free toy pool, as in
-     smoke_video_frames.py): runs precheck -> simulation -> check and finishes; refuses NEURONS
-     or SPAN with JOB, and a SEED that is not the job's; stops before simulating when the
-     placements differ, and before rendering when a DeltaV_end differs (needs NEURON installed
-     only because the job imports rich_footprint -- skipped otherwise)
+     smoke_video_frames.py): runs precheck -> simulation -> check and finishes; FRAMES_DIR renders
+     an earlier run again without simulating (VIDEOS=culture, PLOT_NEURONS drawn); refuses
+     FRAMES_DIR with JOB, NEURONS or SPAN with JOB, and a SEED that is not the job's; stops before
+     simulating when the placements differ, and before rendering when a DeltaV_end differs (needs
+     NEURON installed only because the job imports rich_footprint -- skipped otherwise)
   6  pure ASCII, LF only
 Exit status 1 on any failure.
 """
@@ -309,6 +310,17 @@ def test_job(tmp):
           and "done -> v_ok" in out, "JOB=ftdT: precheck OK, simulation, check OK, done")
     if r.returncode != 0:
         print(out[-1500:])
+    r = job(repo, env, FRAMES_DIR="v_ok", VIDEOS="culture", CULTURE_IDS="0", PLOT_NEURONS="3")
+    out = r.stdout + r.stderr
+    vids = [f for f in os.listdir(os.path.join(repo, "v_ok")) if f.startswith("culture_video_0_L80")]
+    check(r.returncode == 0 and "render only" in out and "[video_frames]" not in out
+          and "video 1" not in out and "3 of 6 neurons drawn" in out and vids,
+          "FRAMES_DIR=v_ok VIDEOS=culture PLOT_NEURONS=3: renders the culture video again, 3 of "
+          "6 neurons, no simulation, no probability video")
+    if r.returncode != 0:
+        print(out[-1500:])
+    r = job(repo, env, FRAMES_DIR="v_ok", JOB="ftdT")
+    check(r.returncode != 0 and "give one of the two" in r.stderr, "FRAMES_DIR with JOB is refused")
     r = job(repo, env, JOB="ftdT", NEURONS=N, OUT="v_n")
     check(r.returncode != 0 and "leave NEURONS and SPAN unset" in r.stderr,
           "NEURONS with JOB is refused")
@@ -333,7 +345,8 @@ def test_job(tmp):
 # ----------------------------------------------------------------------------- 6
 def test_ascii():
     print("6  pure ASCII, LF only")
-    files = ["make_prob_videos.py", "video_campaign_check.py", "smoke_video_campaign.py",
+    files = ["make_prob_videos.py", "make_culture_videos.py", "smoke_culture_videos.py",
+             "video_campaign_check.py", "smoke_video_campaign.py",
              "culture_merge.py", "smoke_test_campaign_analysis.py", "video_frames.py",
              "jobs/video_frames.pbs", "jobs/analysis.pbs", "jobs/merge_all.sh"]
     bad = [f for f in files

@@ -19,6 +19,9 @@ Checks
  10  angle: theta convention (anode 0 deg, cathode 180 deg) and ensemble P(depol | theta)
      flips between phases
  11  soma gradient: +10 mV is red, -10 mV is blue, 0 is near white; state mode still renders
+ 12  --n-somata: a seeded random subset is drawn; its counts (state_counts_matrix) equal a direct
+     recount of those neurons; the plain style has grey branches and edge-less somata; the
+     specimen style still renders
 
 Paths: run it from the project folder. If the project's morphologies.py is importable, the three
 REAL specimens are used; otherwise a stub maps every name to one .asc (MORPH_ASC, or the first
@@ -196,6 +199,40 @@ def main():
            and len(ps) == 1 and os.path.getsize(ps[0]) > 10_000)
     ok &= report("11", c11, f"dVm colours +10 {np.round(cp[:3],2)}, -10 {np.round(cm[:3],2)}, "
                  f"0 {np.round(c0[:3],2)}; state-mode video written")
+
+    # 12 -- a subset of the culture's neurons, and the two styles
+    keep = np.sort(np.random.default_rng(0).choice(len(tab), size=40, replace=False))
+    tsub = tab.iloc[keep].reset_index(drop=True)
+    ccoord = C.dipole_theta_deg(tsub.x, tsub.y, elec, sign)
+    cm12 = C.state_counts_matrix(ccoord, dv[:, keep], fb[:, keep], ed, 0.1)
+    xy_keep = set(zip(tsub.x.round(2), tsub.y.round(2)))
+    dsub = sub[[xy in xy_keep for xy in zip(sub.x.round(2), sub.y.round(2))]]
+    cdir = C.state_counts_vs(C.dipole_theta_deg(dsub.x, dsub.y, elec, sign), dsub, times, ed, 0.1)
+    same = all(np.array_equal(cm12[q], cdir[q]) for q in ("n", "act", "dep", "hyp"))
+    p12 = C.main(["--frames", path, "--cultures", "0", "--layer", "80", "--n-somata", "40",
+                  "--hold-end", "0", "--outdir", os.path.join(OUT, "subset")])
+    import matplotlib.pyplot as plt
+    from matplotlib.collections import LineCollection
+    fig, ax = plt.subplots()
+    xg = np.arange(-100, 101, 50.0)
+    gg = np.zeros((xg.size, xg.size))
+    _, _, sc, nd = C._draw_scene(ax, 100.0, 50.0, gg, 1.0, elec, 25.0, tsub, polys, 5, centre, 10.0,
+                                 20.0, "plain")
+    a12, d12, h12 = P.states(dv[k][keep], fb[k][keep], 0.1)
+    C._update_somata(sc, tsub, {"act": a12, "dep": d12, "hyp": h12, "neu": ~(a12 | d12 | h12)},
+                     dv[k][keep], "dvm", "plain")
+    lc = [c for c in ax.collections if isinstance(c, LineCollection)]
+    grey = all(np.allclose(c.get_colors()[:, :3], C.matplotlib.colors.to_rgb(C.BRANCH_GREY))
+               for c in lc) if lc else True
+    noedge = all(len(sc[q].get_linewidths()) == 0 or float(np.max(sc[q].get_linewidths())) == 0.0
+                 for q in ("act", "grad"))
+    plt.close(fig)
+    pspec = C.main(["--frames", path, "--cultures", "1", "--layer", "80", "--style", "specimen",
+                    "--hold-end", "0", "--outdir", os.path.join(OUT, "specimen")])
+    ok &= report("12", same and len(p12) == 1 and os.path.getsize(p12[0]) > 10_000 and nd == min(5, 40)
+                 and grey and noedge and len(pspec) == 1,
+                 f"subset counts == direct recount: {same}; 40-neuron video written; branches grey: "
+                 f"{grey} ({len(lc)} collections); soma edges off: {noedge}; specimen style renders")
 
     print("\nSMOKE TEST:", "ALL PASSED" if ok else "SOME CHECKS FAILED")
     return ok
