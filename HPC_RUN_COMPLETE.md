@@ -346,6 +346,29 @@ placement from (seed, culture) and try the current square first, then the one us
 2026-09-28 (+/-500 um around (0, 0), 1700 per culture); a row is accepted only if a draw
 reproduces it exactly.
 
+### Three-outcome snapshot of one culture (no NEURON)
+
+`culture_states_hpc.py` draws, for ONE culture and ONE slab thickness, the somata that fired and
+those depolarized / hyperpolarized at t0 by at least 1 mV (DeltaV_end), over the culture's own
+sliced morphologies: every rotation is rebuilt from (seed, culture) and checked against the table's
+positions. It reads ONE table -- a culture_statistics `merged_<outcome>.csv`, a `culture_P*.csv`
+(culture_merge) or one raw `part_NNN.csv` -- and infers the culture size and the soma square from
+it (ftd: 2000 neurons, +/-300 um around (0, -30); before 2026-09-28: 1700, +/-500 um around (0, 0)).
+Self-contained on purpose (numpy, pandas, matplotlib, morphio); `smoke_test_culture_states.py` pins
+its copies of the campaign code (draws, square, outcome rules, electrodes, slicing) to the
+originals. Details and checks: `HOWTO_culture_states.md`.
+
+```bash
+python smoke_test_culture_states.py | tail -1        # offline, < 1 min: All smoke tests passed.
+python culture_states_hpc.py --input analysis/<run>/stats/activation/merged_activation.csv --list
+qsub -v INPUT=analysis/<run>/stats/activation/merged_activation.csv,CULTURE=full_tuned_S50000_C0 jobs/culture_states.pbs
+qsub -v JOB=ftd01,CULTURE=0 jobs/culture_states.pbs  # culture 0 of a FINISHED job, from its own merge
+```
+
+Log `logs/estim_culture_states.log` (must show `14/14 passed`, the `parameters:` line with the
+campaign's N / S / centre, `morphologies drawn for [...]` with 6 specimens, `done:`); output
+`figures/culture_states_<CULTURE>_L<LAYER>.{png,pdf}`. One core, seconds to ~2 min.
+
 ## Git: push (laptop) and pull (cluster)
 
 Laptop, in your clone of github.com/matig331/ElectricalSimulation (the tarball carries whole

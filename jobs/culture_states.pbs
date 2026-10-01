@@ -1,0 +1,143 @@
+#!/bin/bash
+# ---------------------------------------------------------------------------
+# PBS/Torque -- THREE-OUTCOME SNAPSHOT of ONE simulated culture (culture_states_hpc.py).
+#
+# One culture, one slab thickness, three panels: the somata that FIRED (green) and those
+# DEPOLARIZED / HYPERPOLARIZED at t0 by at least NEU mV (red / blue, by DeltaV_end), over the
+# culture's own sliced morphologies -- every rotation is rebuilt from the campaign's seed and
+# checked against the table (positions and theta_orient_deg). Reads ONE table: no NEURON, no merge.
+# See HOWTO_culture_states.md.
+#
+# Pick the culture first (login node, seconds):
+#   python culture_states_hpc.py --input <table> --list
+# Submit from the pipeline folder:
+#   qsub -v INPUT=analysis/<run>/stats/activation/merged_activation.csv,CULTURE=full_tuned_S50000_C0 jobs/culture_states.pbs
+#   qsub -v JOB=ftd01,CULTURE=0 jobs/culture_states.pbs        # culture 0 of campaign job ftd01
+# Options, comma-separated:
+#   INPUT=...      ONE table: merged_<outcome>.csv (culture_statistics), culture_P<outcome>.csv
+#                  (culture_export / culture_merge) or one raw part_NNN.csv -- same neurons, same outcomes
+#   JOB=ftd01      instead of INPUT: that job's merge results_<model>/<JOB>/culture_Pactivation.csv
+#                  (written once the job finished); CULTURE may then be the bare index (0 -> S<seed>_C0)
+#   MODEL=         with JOB: results_<MODEL>/ (default config.cell_model)
+#   CULTURE=...    culture name as printed by --list (default: the first culture of the file)
+#   LAYER=80       slab thickness (um): 40, 80 or 120
+#   MORPH_DIR=eyal_archive   folder with specimen_*/morphology.asc (the campaign's); none -> somata only
+#   OUT=figures/culture_states_<CULTURE>_L<LAYER>   output stem -> .png .pdf (+ .log)
+#   NEU=1  DVM_MAX=10  HALF=   threshold and colour limit (mV); map half-width (um, default data extent)
+#   SEED=  N_NEURONS=          only for a table without a `seed` column / to force the culture size
+#                              (default: both from the table; a culture still being written is fine)
+#   NO_ORIENT_CHECK=1          only if the log says theta_orient_deg follows another definition
+#                              (rotations then checked on the positions: wrong for a culture cut short)
+#
+# Correct output (this log): "14/14 passed"; "parameters: ... (inferred)" with the campaign's N, S and
+# centre (ftd: N=2000, S=300 um, centre (0, -30); before 2026-09-28: N=1700, S=500 um, centre (0, 0));
+# "morphologies drawn for [...]" with the 6 specimens; the counts line; "done: <OUT>.png".
+# Cost: seconds to ~2 min on one core, ~350 MB (1.2 M-row table, 1700 neurons, 6 morphologies).
+# ---------------------------------------------------------------------------
+#PBS -N estim_culture_states
+#PBS -l nodes=1:ppn=1
+#PBS -l walltime=00:30:00
+#PBS -q cpu
+#PBS -j oe
+#PBS -o logs/estim_culture_states.log
+
+set -euo pipefail
+
+REPO=""
+for cand in "${PBS_O_WORKDIR:-}" "${PBS_O_WORKDIR:-}/.." "$PWD" "$PWD/.." "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)"; do
+    if [ -n "$cand" ] && [ -f "$cand/culture_states_hpc.py" ]; then
+        REPO="$(cd "$cand" && pwd)"; break
+    fi
+done
+if [ -z "$REPO" ]; then echo "FATAL: repo not found (no culture_states_hpc.py)" >&2; exit 1; fi
+cd "$REPO"
+mkdir -p logs
+
+if [ -f jobs/env_setup.sh ]; then
+    source jobs/env_setup.sh
+else
+    echo "NOTE: jobs/env_setup.sh absent -- relying on the ambient environment"
+fi
+
+# ------------------------------------------------------------------ parameters (qsub -v ...)
+INPUT="${INPUT:-}"
+JOB="${JOB:-}"
+MODEL="${MODEL:-}"
+CULTURE="${CULTURE:-}"
+LAYER="${LAYER:-80}"
+MORPH_DIR="${MORPH_DIR:-eyal_archive}"
+NEU="${NEU:-1}"
+DVM_MAX="${DVM_MAX:-10}"
+HALF="${HALF:-}"
+SEED="${SEED:-}"
+N_NEURONS="${N_NEURONS:-}"
+NO_ORIENT_CHECK="${NO_ORIENT_CHECK:-0}"
+
+if [ -n "$JOB" ]; then
+    source jobs/results_layout.sh
+    MODEL_EFF="${MODEL:-$(cfg_cell_model)}"
+    if [ -z "$INPUT" ]; then
+        INPUT="results_${MODEL_EFF}/${JOB}/culture_Pactivation.csv"
+        if [ ! -f "$INPUT" ]; then
+            echo "FATAL: JOB=$JOB has no merge $INPUT (job still running?)." \
+                 "Give INPUT=results_${MODEL_EFF}/parts_${JOB}/part_NNN.csv instead." >&2
+            exit 1
+        fi
+    fi
+    if [[ "$CULTURE" =~ ^[0-9]+$ ]]; then
+        JOB_SEED="$(python -c 'import sys, pandas as pd; print(int(pd.read_csv(sys.argv[1], usecols=["seed"], nrows=1)["seed"].iloc[0]))' "$INPUT")"
+        CULTURE="S${JOB_SEED}_C${CULTURE}"
+    fi
+fi
+if [ -z "$INPUT" ]; then
+    echo "FATAL: give INPUT=<table> (or JOB=<campaign job>); list its cultures with" \
+         "python culture_states_hpc.py --input <table> --list" >&2
+    exit 2
+fi
+if [ ! -f "$INPUT" ]; then echo "FATAL: INPUT=$INPUT is not a file" >&2; exit 1; fi
+
+MORPH_ON=0
+MORPH_ARGS=()
+case "$MORPH_DIR" in
+    none|NONE|0) ;;
+    *)  if [ ! -d "$MORPH_DIR" ]; then echo "FATAL: MORPH_DIR=$MORPH_DIR is not a folder" >&2; exit 1; fi
+        MORPH_ON=1
+        MORPH_ARGS=(--morph-dir "$MORPH_DIR" --require-all-morph) ;;
+esac
+EXTRA=()
+if [ -n "$CULTURE" ]; then EXTRA+=(--culture "$CULTURE"); fi
+if [ -n "$HALF" ]; then EXTRA+=(--half "$HALF"); fi
+if [ -n "$SEED" ]; then EXTRA+=(--seed "$SEED"); fi
+if [ -n "$N_NEURONS" ]; then EXTRA+=(--n-neurons "$N_NEURONS"); fi
+if [ "$NO_ORIENT_CHECK" = "1" ]; then EXTRA+=(--no-orient-check); fi
+OUT="${OUT:-figures/culture_states_${CULTURE:-first}_L${LAYER%.*}}"
+mkdir -p "$(dirname "$OUT")"
+
+echo "input      : $INPUT"
+echo "culture    : ${CULTURE:-<first in the file>}   layer: $LAYER um   threshold: $NEU mV"
+if [ "$MORPH_ON" = "1" ]; then
+    N_ASC="$(find "$MORPH_DIR" -path "*specimen_*" -name morphology.asc 2>/dev/null | wc -l || true)"
+    echo "morphology : $MORPH_DIR ($N_ASC specimen_*/morphology.asc)"
+else
+    echo "morphology : none (somata only)"
+fi
+echo "output     : $OUT.{png,pdf}, log $OUT.log"
+
+echo "--- built-in self-test (synthetic data, < 1 min) ---"
+if ! ST="$(python culture_states_hpc.py --selftest 2>&1)"; then
+    echo "$ST"
+    echo "FATAL: self-test failed -- figure not drawn" >&2
+    exit 1
+fi
+echo "$ST" | tail -1
+echo "---------------------------------------------------------------"
+
+python culture_states_hpc.py --input "$INPUT" --layer "$LAYER" --neu "$NEU" --dvm-max "$DVM_MAX" \
+    ${EXTRA[@]+"${EXTRA[@]}"} ${MORPH_ARGS[@]+"${MORPH_ARGS[@]}"} --out "$OUT" 2>&1 | tee "$OUT.log"
+if [ "$MORPH_ON" = "1" ] && ! grep -q "morphologies drawn for" "$OUT.log"; then
+    echo "WARNING: morphologies NOT drawn (see the NOTE above): the figure shows the somata only" >&2
+fi
+if grep -q "rotations checked through the positions only" "$OUT.log"; then
+    echo "WARNING: rotations NOT checked on theta_orient_deg: right only if every culture is complete" >&2
+fi
+echo "done: $OUT.png"
